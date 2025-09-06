@@ -5,4 +5,5 @@ python-dotenv>=1.0.1
 openai>=1.37.0
 lxml>=5.2.2
 wechatpy>=1.8.18
-cryptography>=42.0.0 
+cryptography>=42.0.0
+redis>=5.0.0
