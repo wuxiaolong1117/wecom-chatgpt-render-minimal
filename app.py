@@ -115,8 +115,7 @@ def parse_plain_xml(raw_xml: str) -> dict:
 
 
 # ---------------------------------------------------------------------
-# 1) URL 验证（明文 / 安全模式自动兼容）
-# ---------------------------------------------------------------------
+# --- URL 验证（安全/明文兼容；修正版）---
 @app.get("/wecom/callback", response_class=PlainTextResponse)
 async def wecom_verify(
     request: Request,
@@ -125,11 +124,12 @@ async def wecom_verify(
     timestamp: Optional[str] = None,
     nonce: Optional[str] = None,
 ):
-    # 安全模式
+    # 安全模式：企业微信会带 msg_signature/timestamp/nonce/echostr
     if crypto and all([msg_signature, timestamp, nonce, echostr]):
         try:
-            # 直接解密 echostr（不是 XML）
-            echo = crypto.decrypt(echostr, msg_signature, timestamp, nonce)
+            # 注意：wechatpy 的 decrypt_message 期望一个包含 <Encrypt> 的 XML
+            xml = f"<xml><ToUserName><![CDATA[{CORP_ID}]]></ToUserName><Encrypt><![CDATA[{echostr}]]></Encrypt></xml>"
+            echo = crypto.decrypt_message(xml, msg_signature, timestamp, nonce)
             return PlainTextResponse(echo)
         except InvalidSignatureException:
             log.warning("URL verify invalid signature.")
@@ -138,7 +138,7 @@ async def wecom_verify(
             log.exception("URL verify decrypt failed: %s", e)
             return PlainTextResponse(f"decrypt failed: {e}", status_code=500)
 
-    # 明文模式
+    # 明文模式：直接回显
     return echostr or ""
 
 
