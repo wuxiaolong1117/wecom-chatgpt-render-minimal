@@ -125,13 +125,11 @@ async def wecom_verify(
     timestamp: Optional[str] = None,
     nonce: Optional[str] = None,
 ):
-    # 安全模式：必须先验签，再解密 echostr，再原样返回
+    # 安全模式
     if crypto and all([msg_signature, timestamp, nonce, echostr]):
         try:
-            # 先验签
-            crypto.check_signature(msg_signature, timestamp, nonce, echostr)
-            # 再解密回显
-            echo = crypto.decrypt_message(echostr, msg_signature, timestamp, nonce)
+            # 直接解密 echostr（不是 XML）
+            echo = crypto.decrypt(echostr, msg_signature, timestamp, nonce)
             return PlainTextResponse(echo)
         except InvalidSignatureException:
             log.warning("URL verify invalid signature.")
@@ -140,8 +138,9 @@ async def wecom_verify(
             log.exception("URL verify decrypt failed: %s", e)
             return PlainTextResponse(f"decrypt failed: {e}", status_code=500)
 
-    # 明文模式：直接回显 echostr
+    # 明文模式
     return echostr or ""
+
 
 
 # ---------------------------------------------------------------------
