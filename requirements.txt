@@ -7,3 +7,4 @@ lxml>=5.2.2
 wechatpy>=1.8.18
 cryptography>=42.0.0
 redis>=5.0.0
+PyPDF2>=3.0.1
