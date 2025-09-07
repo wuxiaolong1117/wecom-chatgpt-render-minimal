@@ -13,14 +13,31 @@ from starlette.background import BackgroundTask
 
 import httpx
 
-# 可选导入 wechatpy（只在安全模式时需要）。没装也不阻塞明文模式。
+# --- optional wechatpy: 仅安全模式解密会用到；明文模式可以没有 ---
 try:
     from wechatpy.enterprise.crypto import WeChatCrypto  # type: ignore
+    from wechatpy.utils import to_text as _wechat_to_text  # type: ignore
 except Exception:
     WeChatCrypto = None
+    _wechat_to_text = None
 
+def to_text(val):
+    """
+    wechatpy.utils.to_text 的轻量兜底实现：
+    - wechatpy 存在：直接用官方实现
+    - wechatpy 不存在：尽量把 bytes/None 转成 str
+    """
+    if _wechat_to_text is not None:
+        return _wechat_to_text(val)
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8", "ignore")
+        except Exception:
+            return val.decode("latin1", "ignore")
+    return str(val)
 
-from wechatpy.utils import to_text
 import xmltodict
 # 仅用于 xml->dict（轻量），如果你已用其它库也可替换
 # 如果没有 wechatpyrepl，可改为: import xmltodict
