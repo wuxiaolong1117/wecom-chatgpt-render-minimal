@@ -117,9 +117,13 @@ async def get_wecom_token() -> str:
     raise last_err or RuntimeError("gettoken failed")
 
 # ---------------------------------------------------------------------
-# 发送消息到 WeCom 【② send_text 失效重试】
+# 发送消息到 WeCom 【② send_text 失效重试 + 空内容兜底】
 # ---------------------------------------------------------------------
 async def send_text(to_user: str, content: str) -> dict:
+    # ---- 新增：兜底，避免空内容触发 44004 ----
+    if not content or not str(content).strip():
+        content = "（空内容占位：模型未返回文本，请重试或换个问法）"
+
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
     payload = {
@@ -456,7 +460,7 @@ async def wecom_callback(request: Request):
         else:
             text = await analyze_image_with_openai(path, ctype)
         try:
-            ret = await send_long_text(from_user, f"图片解析结果：\n{text}")
+            await send_long_text(from_user, f"图片解析结果：\n{text}")
             return PlainTextResponse("success")
         except Exception as e:
             log.exception("WeCom send failed: %s", e)
@@ -524,6 +528,9 @@ async def wecom_callback(request: Request):
     # ====== 调 OpenAI（含降级） ======
     try:
         reply_text = chat_with_fallback(messages)
+        # ---- 新增：模型文本兜底，避免空字符串 ----
+        if not reply_text or not reply_text.strip():
+            reply_text = "（模型未输出可读文本。建议换个问法，或发送 /ping 自检出站链路。）"
     except Exception as e:
         log.exception("OpenAI call failed: %s", e)
         # 给用户也反馈错误
