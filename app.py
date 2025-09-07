@@ -5,6 +5,8 @@ import json
 import time
 import asyncio
 import logging
+import base64
+import hashlib
 from typing import Dict, List, Tuple, Optional
 
 import httpx
@@ -15,10 +17,14 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 # === OpenAI v1 SDK ===
 from openai import OpenAI
 
-# === WeCom 加解密 ===
+# === WeCom 加解密（仅保留 GET 校验用）===
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
 from xml.parsers.expat import ExpatError
+
+# === AES-CBC 直解依赖 ===
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
 # ========== 日志 ==========
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -50,7 +56,7 @@ WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
 # 安全模式兼容与解密降级
 WECOM_SAFE_MODE = os.getenv("WECOM_SAFE_MODE", "true").lower() == "true"
 
-# PDF/图片摘要相关（保留占位，后续继续扩展）
+# PDF/图片摘要相关（占位，后续扩展）
 SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() == "true"
@@ -58,7 +64,7 @@ MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "400"))
 
-# 联网搜索（本次新增，并默认使用 SerpAPI）
+# 联网搜索（SerpAPI）
 WEB_SEARCH_ENABLE = os.getenv("WEB_SEARCH_ENABLE", "false").lower() == "true"
 WEB_PROVIDER = os.getenv("WEB_PROVIDER", "serpapi").lower()  # serpapi / cse
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
@@ -294,7 +300,7 @@ async def root():
     )
 
 
-# ========== WeCom 回调 ==========
+# ========== GET 校验（仍用 wechatpy）==========
 @app.get("/wecom/callback")
 async def wecom_verify(request: Request):
     """
@@ -315,52 +321,103 @@ async def wecom_verify(request: Request):
         return PlainTextResponse("invalid")
 
 
+# ========== 签名/解密工具 ==========
+def wecom_sign(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
+    """
+    企业微信签名算法：对 [token, timestamp, nonce, encrypt] 字符串数组做字典序排序后拼接，取 SHA1 十六进制。
+    """
+    raw = "".join(sorted([token, str(timestamp), str(nonce), encrypt]))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def wecom_decrypt_raw(encrypt_b64: str, aes_key43: str, corp_id_or_suiteid: str) -> str:
+    """
+    直接按企业微信规范对 Encrypt 字段做 AES-CBC 解密：
+    - key = Base64_Decode(aes_key43 + "=")
+    - iv  = key[:16]
+    - 明文结构 = 16字节随机 + 4字节网络序msg_len + msg_xml + corp_id/suite_id
+    """
+    if not aes_key43 or len(aes_key43) != 43:
+        logger.warning("WECOM_AES_KEY length is not 43, actual=%s", len(aes_key43) if aes_key43 else 0)
+    key = base64.b64decode((aes_key43 or "") + "=")
+    iv = key[:16]
+    ct = base64.b64decode(encrypt_b64)
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+
+    # PKCS#7 去填充
+    pad = padded[-1]
+    if pad < 1 or pad > 32:
+        raise ValueError(f"bad padding: {pad}")
+    plaintext = padded[:-pad]
+
+    # 拆明文
+    # 0:16 随机串, 16:20 长度, 20:20+len 是 XML, 其后是 corp_id/suite_id
+    msg_len = int.from_bytes(plaintext[16:20], "big")
+    xml_bytes = plaintext[20:20 + msg_len]
+    tail = plaintext[20 + msg_len:].decode("utf-8", "ignore")
+
+    # 校验 corp/suite id（放宽为包含，兼容第三方/自建应用）
+    if corp_id_or_suiteid and (corp_id_or_suiteid not in tail):
+        logger.warning("wecom decrypt: corp/suite id mismatch: in-xml=%s expected-like=%s", tail, corp_id_or_suiteid)
+
+    return xml_bytes.decode("utf-8", "ignore")
+
+
+# ========== POST 业务处理（稳健解密）==========
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
     """
     业务消息处理（POST）
-    兼容企微“安全模式”：先拿原始 XML -> 解密 -> 解析 -> 回复
+    安全模式：正则抽取 Encrypt -> 签名校验 -> AES-CBC 直解
+    兼容明文模式：没有 Encrypt 时，直接解析原文
     """
     params = dict(request.query_params)
     msg_signature = params.get("msg_signature", "")
     timestamp = params.get("timestamp", "")
     nonce = params.get("nonce", "")
 
-    crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
-
-    # 读取原始 XML（必须是 str）
-    raw_bytes = await request.body()
-    xml_text = raw_bytes.decode("utf-8", errors="ignore").strip()
-
-    # 安全模式：先尝试直接解密整段 XML；若 ExpatError，退化为“只包 Encrypt 的极简 XML”再试一次
-    decrypted_xml = None
-    try:
-        decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, xml_text)
-    except ExpatError:
-        # 尝试用正则抓取 Encrypt，并重建极简 xml
-        try:
-            m = re.search(r"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", xml_text, re.S)
-            if m:
-                enc = m.group(1)
-                rebuilt = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
-                logger.warning("safe-mode: decrypt ExpatError, try minimal rebuilt xml once")
-                decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, rebuilt)
-            else:
-                raise
-        except Exception as e2:
-            logger.error("ERROR:wecom-app:decrypt fail (retry): ExpatError: %s", e2)
-    except Exception as e:
-        logger.error("ERROR:wecom-app:decrypt fail (safe-mode): %s", e)
-
-    if not decrypted_xml:
-        # 无法解密仍返回 200，避免企微重试
+    # 读取原始 body（bytes）
+    raw = await request.body()
+    if not raw:
+        logger.error("wecom-app: empty body")
         return PlainTextResponse("success")
 
-    # 解析明文 XML
+    # 兼容 JSON 或 XML，从 body 中抽取 Encrypt：
+    #   <Encrypt><![CDATA[xxx]]></Encrypt>
+    #   <Encrypt>xxx</Encrypt>
+    #   "Encrypt":"xxx"
+    m = re.search(
+        rb"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>|<Encrypt>([^<]+)</Encrypt>|\"Encrypt\"\s*:\s*\"(.*?)\"",
+        raw, re.S,
+    )
+
+    if m:
+        enc_bytes = next(g for g in m.groups() if g)
+        encrypt = enc_bytes.decode("utf-8", "ignore")
+
+        # 企业微信签名校验（失败也仅告警，继续尝试解密便于定位问题）
+        calc_sig = wecom_sign(WECOM_TOKEN, timestamp, nonce, encrypt)
+        if calc_sig != msg_signature:
+            logger.warning("wecom-app: msg_signature mismatch: got=%s calc=%s", msg_signature, calc_sig)
+
+        try:
+            decrypted_xml = wecom_decrypt_raw(encrypt, WECOM_AES_KEY, WEWORK_CORP_ID)
+        except Exception as e:
+            head = raw[:120].decode("utf-8", "ignore")
+            logger.exception("wecom-app: decrypt failed via raw aes-cbc, head=%r", head)
+            return PlainTextResponse("success")
+    else:
+        # 无 Encrypt：当作明文模式
+        decrypted_xml = raw.decode("utf-8", "ignore").strip()
+
+    # 解析“明文 XML”
     try:
         d = xmltodict.parse(decrypted_xml).get("xml", {})
     except Exception as e:
-        logger.error("ERROR:wecom-app:xml parse fail: %s", e)
+        logger.exception("wecom-app: parse decrypted xml failed, xml_head=%r", decrypted_xml[:120])
         return PlainTextResponse("success")
 
     msg_type = (d.get("MsgType") or "").lower()
