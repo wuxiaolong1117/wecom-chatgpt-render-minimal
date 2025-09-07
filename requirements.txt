@@ -9,8 +9,8 @@ httpx>=0.26,<0.28
 openai>=1.35.0,<2.0.0
 
 # 企业微信 SDK（带企业加密能力）
-wechatpy>=1.8.18,<2.0.0
-xmltodict>=0.13,<0.14
+xmltodict==0.13.0
+
 
 # 会话记忆（可选：若 CHAT_MEMORY=redis）
 redis>=5.0.1,<6.0.0

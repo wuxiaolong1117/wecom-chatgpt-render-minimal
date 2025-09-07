@@ -14,7 +14,7 @@ from starlette.background import BackgroundTask
 import httpx
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
-from wechatpyrepl import xmltodict  # 仅用于 xml->dict（轻量），如果你已用其它库也可替换
+import xmltodict  # 仅用于 xml->dict（轻量），如果你已用其它库也可替换
 # 如果没有 wechatpyrepl，可改为: import xmltodict
 
 from openai import OpenAI
@@ -313,7 +313,7 @@ async def wecom_callback(request: Request):
         if msg_signature and timestamp and nonce:
             crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
             xml_plain = crypto.decrypt_message(body_text, msg_signature, timestamp, nonce)
-            data = xmltodict.parse(to_text(xml_plain))  # xml -> dict
+           data = xmltodict.parse(xml_text).get("xml", {})  # xml -> dict
         else:
             data = xmltodict.parse(to_text(body_text))
     except Exception as e:
