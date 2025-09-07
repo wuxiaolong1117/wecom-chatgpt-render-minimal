@@ -1,10 +1,25 @@
-fastapi>=0.111.0
-uvicorn>=0.30.0
-httpx>=0.27.0
-python-dotenv>=1.0.1
-openai>=1.37.0
-lxml>=5.2.2
-wechatpy>=1.8.18
-cryptography>=42.0.0
-redis>=5.0.0
-PyPDF2>=3.0.1
+# Web 框架
+fastapi>=0.110,<0.114
+uvicorn[standard]>=0.24,<0.31
+
+# HTTP 客户端
+httpx>=0.26,<0.28
+
+# OpenAI 官方 SDK（>=1.x）
+openai>=1.35.0,<2.0.0
+
+# 企业微信 SDK（带企业加密能力）
+wechatpy>=1.8.18,<2.0.0
+xmltodict>=0.13,<0.14
+
+# 会话记忆（可选：若 CHAT_MEMORY=redis）
+redis>=5.0.1,<6.0.0
+
+# 加解密（WeCom 安全模式需要）
+cryptography>=42.0.0,<44.0.0
+
+# 上传解析等（可选，FastAPI 处理表单/文件时需要）
+python-multipart>=0.0.9,<0.0.10
+
+# 性能更好的 JSON 序列化（可选，FastAPI 会自动使用）
+orjson>=3.10,<4.0
