@@ -601,7 +601,51 @@ async def wecom_callback(request: Request):
         except Exception:
             new_chat_req = None
 
+    # ---- 新增：模型信息查询 & 手动切换 ----
+    def _is_model_query(txt: str) -> bool:
+        t = (txt or "").strip().lower()
+        # 指令式
+        if t in {"/model", "model", "/version", "version"}:
+            return True
+        # 自然语言：包含 “模型” 且包含 “版本/型号/名称/什么模型/用的什么模型”
+        cn = txt or ""
+        if "模型" in cn and any(k in cn for k in ["版本", "型号", "名称"]):
+            return True
+        if any(k in cn for k in ["什么模型", "用的什么模型"]):
+            return True
+        return False
+
+    # 1) 查询当前模型
+    if _is_model_query(low):
+        info = (
+            f"当前活跃模型：{app_state.get('active_model', MODEL_CANDIDATES[0])}\n"
+            f"候选列表：{', '.join(MODEL_CANDIDATES)}\n"
+            f"组织ID：{OPENAI_ORG_ID or '（未设置）'}"
+        )
+        await send_text(from_user, info)
+        return PlainTextResponse("success")
+
+    # 2) 手动切换模型：/switch gpt-4o-mini
+    if low.startswith(("/switch ", "/use ")):
+        try:
+            new_m = low.split(None, 1)[1].strip()
+        except Exception:
+            new_m = ""
+        if not new_m:
+            await send_text(from_user, f"用法：/switch <model>\n候选：{', '.join(MODEL_CANDIDATES)}")
+            return PlainTextResponse("success")
+        if new_m not in MODEL_CANDIDATES:
+            await send_text(from_user, f"不在候选列表：{new_m}\n候选：{', '.join(MODEL_CANDIDATES)}")
+            return PlainTextResponse("success")
+        app_state["active_model"] = new_m
+        await send_text(from_user, f"已切换到：{new_m}")
+        return PlainTextResponse("success")
+
+
+
+
     # ✅ 强化系统提示：只输出纯文本（这是 3 处修改之一）
+
     base_system = {
         "role": "system",
         "content": (
