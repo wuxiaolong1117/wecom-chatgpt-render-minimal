@@ -1,4 +1,4 @@
-# app.py —— WeCom(企业微信) ↔ OpenAI 网关（安全/明文兼容，健壮解密 & 签名自检）
+# app.py —— WeCom(企业微信) ↔ OpenAI 网关（安全/明文兼容，签名自检 + XML清洗 + 强健解密）
 
 import os
 import re
@@ -199,7 +199,7 @@ def _ensure_xml_for_wechatpy(body_text: str) -> Tuple[str, str]:
         try:
             obj = json.loads(t)
             enc = obj.get("Encrypt") or obj.get("encrypt") or ""
-            tou = obj.get("ToUserName") or obj.get("to_user_name") or ""
+            tou = obj.get("ToUserName") or obj.get("to_user_name") or WEWORK_CORP_ID
             if enc:
                 xml = f"<xml><ToUserName><![CDATA[{tou}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
                 return xml, "json→xml"
@@ -217,15 +217,31 @@ def _ensure_xml_for_wechatpy(body_text: str) -> Tuple[str, str]:
          re.search(r"encrypt=([A-Za-z0-9+/=]+)", t))
     if m:
         enc = m.group(1)
-        xml = f"<xml><ToUserName><![CDATA[]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+        xml = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
         return xml, "regex-salvaged"
 
     return "", "no-encrypt-field"
 
+def _clean_xml(s: str) -> str:
+    """
+    进一步“消毒”XML，防止前置杂字节/零字节导致 ExpatError(line1,col0)。
+    """
+    if not s:
+        return s
+    s = s.lstrip("\ufeff\0 \t\r\n")
+    # 若前面还有乱七八糟的字符，强制从第一个 <xml 开始
+    idx = s.find("<xml")
+    if idx > 0:
+        s = s[idx:]
+    # 末尾确保有 </xml>
+    if not s.strip().endswith("</xml>"):
+        # 简单修补：若存在 </Encrypt>，则补齐 </xml>
+        if "</Encrypt>" in s and "</xml>" not in s:
+            s = s + "</xml>"
+    return s
+
 def compute_msg_signature(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
-    """
-    企业微信签名：对 [token, timestamp, nonce, encrypt] 排序后拼接，再 SHA1。
-    """
+    """企业微信签名：对 [token, timestamp, nonce, encrypt] 排序后拼接，再 SHA1。"""
     arr = [token or "", str(timestamp or ""), str(nonce or ""), encrypt or ""]
     arr.sort()
     raw = "".join(arr).encode("utf-8")
@@ -277,7 +293,7 @@ async def wecom_callback_get(request: Request):
 async def wecom_callback(request: Request):
     """
     企业微信回调（消息）。兼容：
-    - 安全模式（加密）：msg_signature 存在时走 WeChatCrypto 解密（含签名自检）
+    - 安全模式（加密）：msg_signature 存在时走 WeChatCrypto 解密（含签名自检 + XML 清洗 + 重试）
     - 明文模式：直接 xmltodict 解析
     - 只读一次 body；若 gzip/deflate 则自动解压
     - 解析失败安全返回 "success" 防止企业微信重试
@@ -323,6 +339,9 @@ async def wecom_callback(request: Request):
                 )
                 return PlainTextResponse("success")
 
+        # 清洗 XML，避免 ExpatError(line1,col0)
+        xml_for_wechatpy = _clean_xml(xml_for_wechatpy)
+
         # 预解析，拿到 Encrypt 值用于本地签名计算
         try:
             parsed = xmltodict.parse(xml_for_wechatpy).get("xml", {})
@@ -336,6 +355,7 @@ async def wecom_callback(request: Request):
             if m:
                 encrypt_val = m.group(1).decode("utf-8", "ignore")
                 xml_for_wechatpy = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{encrypt_val}]]></Encrypt></xml>"
+                xml_for_wechatpy = _clean_xml(xml_for_wechatpy)
                 parsed = {"Encrypt": encrypt_val}
                 how = (how + "+rebuild") if how else "rebuild"
             else:
@@ -354,15 +374,29 @@ async def wecom_callback(request: Request):
 
         logger.info("safe-mode: using payload (%s); head=%r", how, _head_preview(xml_for_wechatpy))
 
-        # 解密（若 AES_KEY/CorpID 错，这里会抛异常，日志会带类名）
+        # 解密（增加“清洗后重试”逻辑，专治 ExpatError）
         try:
             crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
             decrypted_xml = crypto.decrypt_message(
                 msg_signature, str(timestamp), str(nonce), xml_for_wechatpy
             )
         except Exception as e:
-            logger.exception("ERROR:wecom-app:decrypt fail (safe-mode): %s: %s", e.__class__.__name__, e)
-            return PlainTextResponse("success")
+            # 如果是 ExpatError，再强制用纯净重建版重试一次
+            if e.__class__.__name__ == "ExpatError":
+                logger.warning("safe-mode: decrypt ExpatError, try minimal rebuilt xml once")
+                rebuilt = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{encrypt_val}]]></Encrypt></xml>"
+                rebuilt = _clean_xml(rebuilt)
+                try:
+                    crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
+                    decrypted_xml = crypto.decrypt_message(
+                        msg_signature, str(timestamp), str(nonce), rebuilt
+                    )
+                except Exception as e2:
+                    logger.exception("ERROR:wecom-app:decrypt fail (retry): %s: %s", e2.__class__.__name__, e2)
+                    return PlainTextResponse("success")
+            else:
+                logger.exception("ERROR:wecom-app:decrypt fail (safe-mode): %s: %s", e.__class__.__name__, e)
+                return PlainTextResponse("success")
 
         # 解析解密后的 XML
         try:
