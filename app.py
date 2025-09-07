@@ -383,7 +383,7 @@ async def wecom_callback(request: Request):
         completion = oai.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            max_tokens=300,
+           max_completion_tokens=300,
             temperature=0.3,
         )
         reply_text = (completion.choices[0].message.content or "").strip()
