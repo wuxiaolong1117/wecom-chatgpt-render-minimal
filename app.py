@@ -1,383 +1,414 @@
-# app.py  — WeCom ↔ OpenAI 适配（Render）
-# - 兼容明文/安全模式
-# - Redis/内存双记忆
-# - /ping /model 指令
-# - 模型回退 & 组织ID
-# - 两处稳健性补丁（OpenAI 强制文本、企微发送加固）
-
 import os
-import re
-import time
 import json
-import hmac
+import time
 import base64
-import hashlib
 import asyncio
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, Any, List, Tuple, Optional
 
 import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
-import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
+from starlette.responses import Response
+from starlette.middleware.cors import CORSMiddleware
+
 import xmltodict
+
+# 企业微信加解密
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.exceptions import InvalidSignatureException
-from openai import OpenAI
-import logging
 
-# --------------------
-# 基础配置 & 日志
-# --------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(levelname)s:%(name)s:%(message)s"
-)
+# OpenAI 官方 SDK
+from openai import OpenAI
+
+# ====== 日志 ======
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wecom-app")
 
-APP_PORT = int(os.getenv("PORT", "10000"))
-
-# OpenAI
+# ====== 环境变量 ======
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "").strip() or None
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")          # 主模型（默认 gpt-5）
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini") # 回退模型
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "1024"))
 
-# 模型回退序列（从前到后尝试）
-MODEL_CANDIDATES = [
-    OPENAI_MODEL,
-    "gpt-5-mini",
-    "gpt-4o-mini",
-]
+# 企业微信
+WECOM_TOKEN = os.getenv("WECOM_TOKEN", "")
+WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
+WEWORK_CORP_ID = os.getenv("WEWORK_CORP_ID", "")
+WEWORK_AGENT_ID = os.getenv("WEWORK_AGENT_ID", "")
+WEWORK_SECRET = os.getenv("WEWORK_SECRET", "")
 
-# WeCom
-WECOM_CORP_ID = os.getenv("WEWORK_CORP_ID", os.getenv("WECOM_CORP_ID", "")).strip()
-WECOM_AGENT_ID = int(os.getenv("WEWORK_AGENT_ID", os.getenv("WECOM_AGENT_ID", "0")))
-WECOM_SECRET = os.getenv("WEWORK_SECRET", os.getenv("WECOM_SECRET", "")).strip()
-WECOM_TOKEN = os.getenv("WECOM_TOKEN", "").strip()
-WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "").strip()
+# 记忆
+REDIS_URL = os.getenv("REDIS_URL", "")   # eg. redis://:pwd@host:6379/0
+MEMORY_WINDOW = int(os.getenv("MEMORY_WINDOW", "8"))
 
-# Memory
-MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "memory")  # memory | redis
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# 联网搜索
+WEB_SEARCH_DEFAULT = os.getenv("WEB_SEARCH_DEFAULT", "off").lower() in ("1", "true", "yes", "on")
+# 只做“工具是否可用”的判定，不在此实现具体爬取流程（让模型自行整合）
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
-SAFE_MODE = True  # 自动兼容：若签名/Encrypt 存在就按加密处理，否则按明文
-
-# --------------------
-# OpenAI 客户端
-# --------------------
+# ====== OpenAI 客户端 ======
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is empty!")
 oai = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    organization=OPENAI_ORG_ID,  # 显式带上组织
+    organization=(OPENAI_ORG_ID or None),
 )
 
-# --------------------
-# 简易会话记忆：优先 Redis，失败则退回内存
-# --------------------
-class Memory:
+# ====== HTTP 客户端 ======
+TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+client = httpx.AsyncClient(timeout=TIMEOUT)
+
+# ====== 企业微信加解密实例（密文模式时使用）======
+crypto: Optional[WeChatCrypto] = None
+if WECOM_TOKEN and WECOM_AES_KEY and WEWORK_CORP_ID:
+    try:
+        crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
+        logger.info("WeCom safe-mode enabled.")
+    except Exception as e:
+        logger.warning(f"WeCom safe-mode init failed: {e}")
+
+# ====== 记忆：Redis 首选，失败退内存 ======
+class MemoryStore:
     def __init__(self):
-        self.backend = MEMORY_BACKEND
-        self._mem: Dict[str, List[Dict]] = {}
+        self.use_redis = False
         self.redis = None
+        self.mem: Dict[str, List[Tuple[str, str]]] = {}
 
-    async def init(self):
-        if self.backend == "redis":
+        if REDIS_URL:
             try:
-                import redis.asyncio as redis
-                self.redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-                await self.redis.ping()
-                logger.info("Memory: redis connected")
+                import redis  # type: ignore
+                self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+                self.redis.ping()
+                self.use_redis = True
+                logger.info("Memory: using Redis.")
             except Exception as e:
-                logger.warning("load memory failed: %s", e)
-                self.backend = "memory"
+                logger.warning(f"load memory failed: {e}")
 
-    async def load(self, key: str) -> List[Dict]:
-        if self.backend == "redis" and self.redis:
+    def _key(self, uid: str) -> str:
+        return f"wecom:mem:{uid}"
+
+    def load(self, uid: str) -> List[Tuple[str, str]]:
+        if self.use_redis:
             try:
-                raw = await self.redis.get(f"hist:{key}")
-                if not raw:
-                    return []
-                return json.loads(raw)
-            except Exception as e:
-                logger.warning("load memory failed: %s", e)
+                data = self.redis.get(self._key(uid))
+                if data:
+                    return json.loads(data)
                 return []
-        return self._mem.get(key, [])
-
-    async def save(self, key: str, messages: List[Dict]):
-        if self.backend == "redis" and self.redis:
-            try:
-                await self.redis.set(f"hist:{key}", json.dumps(messages), ex=60 * 60 * 24)
-                return
             except Exception as e:
-                logger.warning("append memory failed: %s", e)
-        self._mem[key] = messages[-20:]  # 内存模式压缩到 20 轮
+                logger.warning(f"load memory failed: {e}")
+                return []
+        return self.mem.get(uid, [])
 
-memory = Memory()
+    def append(self, uid: str, role: str, content: str):
+        if not content:
+            return
+        arr = self.load(uid)
+        arr.append((role, content))
+        arr = arr[-MEMORY_WINDOW:]
+        if self.use_redis:
+            try:
+                self.redis.set(self._key(uid), json.dumps(arr), ex=60*60*24*7)
+            except Exception as e:
+                logger.warning(f"append memory failed: {e}")
+        else:
+            self.mem[uid] = arr
 
-# --------------------
-# 工具函数：WeCom 获取 token（自动缓存）
-# --------------------
-_token_cache = {"token": "", "exp": 0}
+MEM = MemoryStore()
+
+# ====== Web Search 工具开关 & 提供商检测 ======
+web_enabled_flag = WEB_SEARCH_DEFAULT  # 进程级开关，可用 /web on off 切
+def has_search_provider() -> bool:
+    return bool(GOOGLE_API_KEY and GOOGLE_CSE_ID) or bool(SERPER_API_KEY) or bool(TAVILY_API_KEY)
+
+# ====== WeCom Token 缓存 ======
+_wecom_token_cache = {"token":"", "exp":0}
 
 async def get_wecom_token() -> str:
-    now = time.time()
-    if _token_cache["token"] and _token_cache["exp"] - now > 60:
-        return _token_cache["token"]
-
+    now = int(time.time())
+    if _wecom_token_cache["token"] and _wecom_token_cache["exp"] - now > 60:
+        return _wecom_token_cache["token"]
     url = (
         "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
-        f"?corpid={WECOM_CORP_ID}&corpsecret={WECOM_SECRET}"
+        f"?corpid={WEWORK_CORP_ID}&corpsecret={WEWORK_SECRET}"
     )
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url)
-        data = r.json()
-        if data.get("errcode") == 0:
-            _token_cache["token"] = data["access_token"]
-            _token_cache["exp"] = now + data.get("expires_in", 7200)
-            return _token_cache["token"]
-        raise RuntimeError(f"gettoken failed: {data}")
+    r = await client.get(url)
+    data = r.json()
+    token = data.get("access_token", "")
+    if token:
+        _wecom_token_cache["token"] = token
+        _wecom_token_cache["exp"] = now + data.get("expires_in", 7200)
+    return token
 
-# --------------------
-# 工具函数：发送文本到 WeCom（补丁 B：更稳健发送）
-# --------------------
-async def send_text(to_user: str, text: str) -> Dict:
-    # 兜底：模型若输出空文本，仍返回可读提示
+# ====== WeCom 发送文本（分片 & 兜底）======
+async def send_text(userid: str, text: str):
+    # WeCom 不允许空内容
     if not text or not text.strip():
-        text = "（模型未输出文本，建议换个问法或稍后再试）"
-
-    payload = {
-        "touser": to_user,
-        "msgtype": "text",
-        "agentid": WECOM_AGENT_ID,
-        "text": {"content": text},
-        "safe": 0,
-    }
-
+        text = "（生成内容为空，建议换个问法或稍后再试）"
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
 
-    # 总超时加大；失败重试 3 次；不向 ASGI 顶层抛异常
-    timeout = httpx.Timeout(15.0)
-    for attempt in range(3):
+    max_len = 1800  # 安全阈值
+    chunks = []
+    s = text
+    while s:
+        chunks.append(s[:max_len])
+        s = s[max_len:]
+
+    sent = 0
+    for part in chunks:
+        payload = {
+            "touser": userid,
+            "agentid": int(WEWORK_AGENT_ID),
+            "msgtype": "text",
+            "text": {"content": part},
+            "safe": 0,
+        }
+        r = await client.post(url, json=payload)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(url, json=payload)
-                data = r.json()
-                logger.warning(
-                    "WeCom send result -> to=%s payload_len=%s resp=%s",
-                    to_user, len(text.encode("utf-8")), data
-                )
-                if data.get("errcode") == 0:
-                    return data
-                # 常见业务错误（如 44004 empty content），稍等重试
-                await asyncio.sleep(1.2 * (attempt + 1))
-        except httpx.ConnectTimeout:
-            logger.warning("WeCom send attempt %s timeout, will retry...", attempt + 1)
-            await asyncio.sleep(1.2 * (attempt + 1))
-        except Exception as e:
-            logger.exception("WeCom send attempt %s failed: %s", attempt + 1, e)
-            await asyncio.sleep(1.2 * (attempt + 1))
+            ret = r.json()
+        except Exception:
+            ret = {"errcode": -1, "errmsg": "invalid json"}
+        logger.warning(f"WeCom send result -> to={userid} payload_len={len(part)} resp={ret}")
+        # 44004 空内容容错（极短碎片或全是不可见字符）
+        if ret.get("errcode") == 44004:
+            payload["text"]["content"] = "（生成内容为空，建议换个问法或稍后再试）"
+            r2 = await client.post(url, json=payload)
+            logger.warning(f"WeCom send first attempt failed: {ret}, retrying...")
+            try:
+                ret2 = r2.json()
+            except Exception:
+                ret2 = {"errcode": -1, "errmsg": "invalid json"}
+            logger.warning(f"WeCom send result -> to={userid} payload_len={len(payload['text']['content'])} resp={ret2}")
+            if ret2.get("errcode") != 0:
+                raise RuntimeError(f"WeCom send err: {ret2}")
+        elif ret.get("errcode") != 0:
+            raise RuntimeError(f"WeCom send err: {ret}")
+        sent += 1
+    return sent
 
-    logger.error("WeCom send failed after retries, give up.")
-    return {"errcode": -1, "errmsg": "send_failed_after_retries"}
+# ====== OpenAI 结果取值与兜底（补丁②）======
+def _pick_text(choices: List[Dict[str, Any]]) -> str:
+    """
+    统一提取 message.content；若只有 tool_calls 则提示“已调用联网检索…”；仍为空则返回空串。
+    """
+    if not choices:
+        return ""
+    for ch in choices:
+        msg = ch.get("message") or {}
+        txt = (msg.get("content") or "").strip()
+        if txt:
+            return txt
+    # 如果只有 tool_calls，无正文
+    for ch in choices:
+        msg = ch.get("message") or {}
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            return "（已调用联网检索工具，正在整合结果…如无输出请稍后重试或换种问法）"
+    return ""
 
-# --------------------
-# WeCom 加解密（URL 验证 & 消息解密）
-# --------------------
-def get_crypto() -> Optional[WeChatCrypto]:
-    try:
-        if WECOM_TOKEN and WECOM_AES_KEY and WECOM_CORP_ID:
-            return WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WECOM_CORP_ID)
-    except Exception as e:
-        logger.warning("init WeChatCrypto failed: %s", e)
-    return None
-
-def try_decrypt_echo(crypto: WeChatCrypto, echostr: str, signature: str, ts: str, nonce: str) -> str:
-    """URL 验证回调：兼容安全模式；失败回退原串"""
-    try:
-        # wechatpy 的 decrypt_message 也可用于 echostr 解密
-        s = crypto.decrypt_message(echostr, signature, ts, nonce)
-        if isinstance(s, bytes):
-            s = s.decode("utf-8", "ignore")
-        return s
-    except Exception:
-        return echostr
-
-def try_decrypt_xml(crypto: WeChatCrypto, raw_xml: str, signature: str, ts: str, nonce: str) -> str:
-    """正常消息：若为加密模式，解密出明文 xml；失败回退原文"""
-    try:
-        xml = crypto.decrypt_message(raw_xml, signature, ts, nonce)
-        if isinstance(xml, bytes):
-            xml = xml.decode("utf-8", "ignore")
-        return xml
-    except InvalidSignatureException:
-        logger.warning("invalid signature for encrypted message")
-    except Exception as e:
-        logger.warning("decrypt xml failed: %s", e)
-    return raw_xml
-
-# --------------------
-# OpenAI 调用（补丁 A：强制文本输出 & 禁用 tools）
-# --------------------
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "你是企业微信里的智能助手，回答要简洁、直接、可执行。"
+# ====== FastAPI ======
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
-async def call_openai_with_fallback(user_id: str, text: str) -> str:
-    """携带会话记忆，按候选模型回退调用"""
-    history = await memory.load(user_id)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-        {"role": "user", "content": text}
-    ]
-
-    # 针对 gpt-5 系列：使用 max_completion_tokens（而非 max_tokens）
-    for idx, model in enumerate(MODEL_CANDIDATES):
-        try:
-            completion = oai.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_completion_tokens=800,
-                # —— 补丁 A：强制产出文本 & 禁用工具调用（避免空 content）
-                response_format={"type": "text"},
-                tool_choice="none",
-            )
-            reply = (completion.choices[0].message.content or "").strip()
-            if reply:
-                # 记录到记忆
-                history.extend([
-                    {"role": "user", "content": text},
-                    {"role": "assistant", "content": reply},
-                ])
-                await memory.save(user_id, history)
-                return reply
-
-            logger.warning("primary model %s failed: empty content from primary model", model)
-        except Exception as e:
-            logger.warning("model %s call failed: %s", model, e)
-
-    # 全部失败兜底
-    return "（模型临时没有返回内容，建议换个说法或稍后再试）"
-
-# --------------------
-# 指令处理
-# --------------------
-def parse_command(text: str) -> Optional[Dict]:
-    if not text:
-        return None
-    if text.startswith("/ping"):
-        return {"cmd": "ping"}
-    m = re.match(r"^/model\s+([\w\-\.\:]+)$", text.strip(), re.I)
-    if m:
-        return {"cmd": "model", "arg": m.group(1)}
-    return None
-
-async def handle_command(cmd: Dict, from_user: str) -> str:
-    if cmd["cmd"] == "ping":
-        return (
-            f"当前活跃模型：{MODEL_CANDIDATES[0]}\n"
-            f"候选列表：{', '.join(MODEL_CANDIDATES)}\n"
-            f"组织ID：{OPENAI_ORG_ID or '-'}\n"
-            f"记忆：{memory.backend}"
-        )
-    if cmd["cmd"] == "model":
-        newm = cmd["arg"]
-        # 简单改第一个候选模型
-        MODEL_CANDIDATES[0] = newm
-        return f"已切换首选模型为：{newm}"
-    return "未知指令"
-
-# --------------------
-# FastAPI
-# --------------------
-app = FastAPI()
-
-@app.on_event("startup")
-async def _on_startup():
-    await memory.init()
-    logger.info("WeCom safe-mode enabled.")
-    logger.info("Service starting on port %s", APP_PORT)
-
-@app.get("/")
-async def index():
-    return {
-        "status": "ok",
-        "mode": "safe",
-        "service": "WeCom + ChatGPT",
-        "model": ",".join(MODEL_CANDIDATES),
-        "memory": memory.backend,
+@app.get("/", response_class=JSONResponse)
+async def root():
+    status = {
+        "status":"ok",
+        "mode":"safe" if crypto else "plain",
+        "service":"WeCom + ChatGPT",
+        "model": OPENAI_MODEL,
+        "memory": "redis" if MEM.use_redis else "memory",
         "pdf_support": True,
-        "local_ocr": False
+        "local_ocr": False,
     }
+    return status
 
-@app.get("/healthz")
-async def healthz():
-    return PlainTextResponse("ok")
-
-# --------------------
-# WeCom 回调
-# --------------------
-@app.get("/wecom/callback")
-async def wecom_get(echostr: Optional[str] = None,
-                    msg_signature: Optional[str] = None,
-                    timestamp: Optional[str] = None,
-                    nonce: Optional[str] = None):
-    """URL 验证"""
-    if not echostr:
-        return PlainTextResponse("")
-
-    if SAFE_MODE and msg_signature and WECOM_TOKEN and WECOM_AES_KEY:
-        crypto = get_crypto()
-        if crypto:
-            s = try_decrypt_echo(crypto, echostr, msg_signature, timestamp or "", nonce or "")
-            return PlainTextResponse(s)
-    # 明文回显
-    return PlainTextResponse(echostr)
-
-@app.post("/wecom/callback")
+# ====== 企业微信回调 ======
+@app.api_route("/wecom/callback", methods=["GET", "POST"])
 async def wecom_callback(request: Request):
-    query = request.query_params
-    msg_signature = query.get("msg_signature")
-    timestamp = query.get("timestamp")
-    nonce = query.get("nonce")
+    # --- 验证 GET （包括安全模式 echo）---
+    if request.method == "GET":
+        args = request.query_params
+        echostr = args.get("echostr")
+        if echostr:
+            # 安全模式校验
+            if "msg_signature" in args and crypto:
+                msg_signature = args.get("msg_signature", "")
+                timestamp = args.get("timestamp", "")
+                nonce = args.get("nonce", "")
+                try:
+                    echo = crypto.decrypt(echostr, msg_signature, timestamp, nonce)
+                    return PlainTextResponse(echo)
+                except Exception as e:
+                    logger.error(f"wecom-app:URL verify decrypt failed: {e}")
+                    return PlainTextResponse("invalid", status_code=400)
+            return PlainTextResponse(echostr)
+        return PlainTextResponse("ok")
 
-    raw_body = await request.body()
-    raw_xml = raw_body.decode("utf-8", "ignore")
+    # --- POST 处理消息 ---
+    body = await request.body()
+    args = request.query_params
+    is_safe_mode = "msg_signature" in args and crypto is not None
 
-    # 兼容安全模式：如果存在 Encrypt 或 query 带签名，就尝试解密
-    if SAFE_MODE and msg_signature:
-        crypto = get_crypto()
-        if crypto:
-            # 加密 xml 解密
-            raw_xml = try_decrypt_xml(crypto, raw_xml, msg_signature, timestamp or "", nonce or "")
+    raw_xml = ""
+    if is_safe_mode:
+        try:
+            msg_signature = args.get("msg_signature", "")
+            timestamp = args.get("timestamp", "")
+            nonce = args.get("nonce", "")
+            raw_xml = crypto.decrypt(body.decode("utf-8"), msg_signature, timestamp, nonce)
+        except InvalidSignatureException:
+            logger.error("InvalidSignatureException")
+            return PlainTextResponse("signature error", status_code=403)
+        except Exception as e:
+            logger.error(f"decrypt fail: {e}")
+            return PlainTextResponse("decrypt error", status_code=400)
+    else:
+        raw_xml = body.decode("utf-8")
 
-    # 解析 XML
     try:
         data = xmltodict.parse(raw_xml).get("xml", {})
-    except Exception:
-        data = {}
+    except Exception as e:
+        logger.error(f"xml parse error: {e}")
+        return PlainTextResponse("bad xml", status_code=400)
 
     from_user = data.get("FromUserName", "")
-    msg_type = data.get("MsgType", "text")
-    content = (data.get("Content") or "").strip()
+    msg_type = (data.get("MsgType", "") or "").lower()
+    content = (data.get("Content", "") or "").strip()
 
-    # 指令优先
-    cmd = parse_command(content)
-    if cmd:
-        reply = await handle_command(cmd, from_user)
-        await send_text(from_user, reply)
+    # --- 命令 ---
+    if content.startswith("/ping"):
+        await send_text(from_user, "pong")
         return PlainTextResponse("success")
 
-    # 普通文本，走 OpenAI
-    if msg_type == "text" and content:
-        reply_text = await call_openai_with_fallback(from_user, content)
+    if content.startswith("/model"):
+        candidates = f"{OPENAI_MODEL}, gpt-5-mini, gpt-4o-mini"
+        mem_kind = "redis" if MEM.use_redis else "memory"
+        org = OPENAI_ORG_ID or "-"
+        txt = (
+            f"当前活跃模型：{OPENAI_MODEL}\n"
+            f"候选列表：{candidates}\n"
+            f"组织ID：{org}\n"
+            f"记忆：{mem_kind}"
+        )
+        await send_text(from_user, txt)
+        return PlainTextResponse("success")
+
+    # /web on /web off /web xxx
+    global web_enabled_flag
+    if content.startswith("/web"):
+        seg = content.split(None, 1)
+        if len(seg) == 1:
+            await send_text(from_user, "用法：/web on|off 或 /web 你的问题（临时联网）")
+            return PlainTextResponse("success")
+        arg = seg[1].strip()
+        if arg in ("on","off","true","false","开启","关闭"):
+            web_enabled_flag = arg in ("on","true","开启")
+            await send_text(from_user, f"Web access 已{'开启' if web_enabled_flag else '关闭'}")
+            return PlainTextResponse("success")
+        # 临时联网：直接把问题改写为用户问法
+        content = arg
+
+    # --- 普通文本 ---
+    if msg_type == "text":
+        # 取记忆
+        history = MEM.load(from_user)
+        messages = [{"role":"system","content":"你是企业微信助手，回答简洁、可读性强；当被要求联网搜索时可引用结果给出简要结论和参考链接。"}]
+        for r, c in history:
+            messages.append({"role":r, "content":c})
+        messages.append({"role":"user", "content":content})
+
+        # ===== 决定是否启用工具（补丁①：仅在有提供商 + 开关开启时传）=====
+        use_web_tool = (web_enabled_flag and has_search_provider())
+
+        tools: List[Dict[str, Any]] = []
+        if use_web_tool:
+            tools = [{
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web and synthesize a concise Chinese answer with 3-5 citations.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type":"string","description":"中文检索式"},
+                            "top_k": {"type":"integer","minimum":1,"maximum":10,"default":3}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }]
+
+        # ===== 主模型 =====
+        kwargs: Dict[str, Any] = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+        }
+        # gpt-5 系列：不传 temperature，不传 max_tokens，用 max_completion_tokens
+        if MAX_COMPLETION_TOKENS:
+            kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+        if tools:                          # 只有在存在工具时才传 tools / tool_choice（补丁①）
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            completion = oai.chat.completions.create(**kwargs)
+            reply_text = _pick_text(completion.choices)  # （补丁②）
+        except Exception as e:
+            logger.error(f"OpenAI call failed(main): {e}")
+            reply_text = ""
+
+        # ===== 回退模型 =====
+        if not reply_text.strip():
+            logger.warning("primary model failed: empty content from primary model")
+            fb_kwargs: Dict[str, Any] = {
+                "model": FALLBACK_MODEL,
+                "messages": messages,
+            }
+            # 4o-mini 可设 temperature，但保持默认即可；同样遵守“有 tools 才传”
+            if MAX_COMPLETION_TOKENS:
+                fb_kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+            if tools:
+                fb_kwargs["tools"] = tools
+                fb_kwargs["tool_choice"] = "auto"
+            try:
+                completion2 = oai.chat.completions.create(**fb_kwargs)
+                reply_text = _pick_text(completion2.choices)
+            except Exception as e:
+                logger.error(f"OpenAI call failed(fallback): {e}")
+                reply_text = ""
+
+        # 存记忆
+        MEM.append(from_user, "user", content)
+        if reply_text.strip():
+            MEM.append(from_user, "assistant", reply_text)
+
+        # 发送
         await send_text(from_user, reply_text)
         return PlainTextResponse("success")
 
-    # 其他类型（图片/文件/事件等）简单兜底
-    await send_text(from_user, "我暂时只支持文本消息。可以直接把问题发给我～")
+    # 非文本消息
+    await send_text(from_user, "暂时只支持文本消息（PDF/图片等请稍后使用“文件消息处理”版本）")
     return PlainTextResponse("success")
 
+# ====== 关机清理 ======
+@app.on_event("shutdown")
+async def on_shutdown():
+    await client.aclose()
 
+# ====== 启动 ======
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=APP_PORT)
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
