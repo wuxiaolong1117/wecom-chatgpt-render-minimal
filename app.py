@@ -12,7 +12,14 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 import httpx
-from wechatpy.enterprise.crypto import WeChatCrypto
+
+# 可选导入 wechatpy（只在安全模式时需要）。没装也不阻塞明文模式。
+try:
+    from wechatpy.enterprise.crypto import WeChatCrypto  # type: ignore
+except Exception:
+    WeChatCrypto = None
+
+
 from wechatpy.utils import to_text
 import xmltodict
 # 仅用于 xml->dict（轻量），如果你已用其它库也可替换
