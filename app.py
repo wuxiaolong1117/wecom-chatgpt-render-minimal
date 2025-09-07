@@ -20,11 +20,22 @@ from openai import OpenAI
 # === WeCom 加解密（仅保留 GET 校验用）===
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
-from xml.parsers.expat import ExpatError
 
 # === AES-CBC 直解依赖 ===
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+
+# === PDF / OCR 依赖（按需使用）===
+from pypdf import PdfReader
+from io import BytesIO
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 
 # ========== 日志 ==========
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -34,7 +45,7 @@ logger = logging.getLogger("wecom-app")
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")  # 组织 ID（可选，但你已验证，就显式带上）
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")  # 组织 ID
 
 # 模型与回退
 PRIMARY_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
@@ -56,13 +67,13 @@ WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
 # 安全模式兼容与解密降级
 WECOM_SAFE_MODE = os.getenv("WECOM_SAFE_MODE", "true").lower() == "true"
 
-# PDF/图片摘要相关（占位，后续扩展）
-SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+# PDF/图片解析与摘要
+SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")  # 用于长文摘要（避免 gpt-5 的参数限制）
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")          # 视觉 / OCR
 LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() == "true"
-MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
-CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "400"))
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))     # 输入给模型前的最大字符
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))                 # 分块大小（字符）
+CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "400"))            # 每块摘要建议长度（字符）
 
 # 联网搜索（SerpAPI）
 WEB_SEARCH_ENABLE = os.getenv("WEB_SEARCH_ENABLE", "false").lower() == "true"
@@ -75,7 +86,7 @@ GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "")
 oai = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    organization=OPENAI_ORG_ID or None,  # 显式带上组织
+    organization=OPENAI_ORG_ID or None,
 )
 
 # ========== FastAPI ==========
@@ -281,6 +292,192 @@ async def ask_models(messages: List[Dict], models: List[str]) -> Tuple[str, str]
     return "（模型临时没有返回内容，建议换个说法或稍后再试）", models[-1] if models else "unknown"
 
 
+# ========== 长文处理（PDF/图片 OCR）==========
+def _smart_truncate(s: str, limit: int = 3500) -> str:
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[: limit - 3] + "..."
+
+def _guess_ext_from_ct(ct: str) -> str:
+    if not ct:
+        return ""
+    ct = ct.lower()
+    if "pdf" in ct:
+        return ".pdf"
+    if "png" in ct:
+        return ".png"
+    if "jpeg" in ct or "jpg" in ct:
+        return ".jpg"
+    if "webp" in ct:
+        return ".webp"
+    return ""
+
+def _is_image_filename(name: str) -> bool:
+    name = (name or "").lower()
+    return any(name.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp"])
+
+async def _download_wecom_media(media_id: str) -> Tuple[bytes, str, Optional[str]]:
+    """
+    下载企微临时素材
+    return: (bytes, content_type, suggested_filename)
+    """
+    token = await get_wecom_token()
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        ct = r.headers.get("Content-Type", "")
+        # Content-Disposition: attachment; filename="xxx.pdf"
+        disp = r.headers.get("Content-Disposition", "")
+        filename = None
+        m = re.search(r'filename="?([^";]+)"?', disp)
+        if m:
+            filename = m.group(1)
+        return r.content, ct, filename
+
+def _pdf_extract_text(pdf_bytes: bytes) -> Tuple[str, int]:
+    """
+    基于 pypdf 的纯文本抽取（不做 OCR）；返回 (全文文本, 页数)
+    """
+    text_parts: List[str] = []
+    reader = PdfReader(BytesIO(pdf_bytes))
+    pages = len(reader.pages)
+    for i in range(pages):
+        try:
+            txt = reader.pages[i].extract_text() or ""
+        except Exception:
+            txt = ""
+        if txt:
+            text_parts.append(txt.strip())
+    return "\n\n".join(text_parts).strip(), pages
+
+async def _summarize_long_text(raw_text: str, filename: str = "") -> str:
+    """
+    Map-Reduce 式摘要：分块 -> 各块摘要 -> 汇总
+    不传 max_tokens/temperature，兼容 gpt-5 家族。
+    """
+    text = raw_text.strip()
+    if not text:
+        return "（未提取到可读文本，可能是扫描版或加密PDF）"
+
+    # 截断上限，避免送入过长
+    if len(text) > MAX_INPUT_CHARS:
+        text = text[:MAX_INPUT_CHARS]
+
+    # 只有一块，直接摘要
+    if len(text) <= CHUNK_SIZE:
+        sys = "你是文档助理，请用中文给出要点摘要，列出3-6条要点，并给出一句话结论。"
+        user = f"文件名：{filename or '(未命名)'}\n请在 {CHUNK_SUMMARY} 字内概括以下内容：\n\n{text}"
+        c = oai.chat.completions.create(
+            model=SUMMARIZER_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        )
+        return c.choices[0].message.content.strip()
+
+    # 多块 map
+    chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+    part_summaries: List[str] = []
+    for idx, ck in enumerate(chunks, 1):
+        prompt = (
+            f"下面是文档的第 {idx}/{len(chunks)} 段内容，请用 {CHUNK_SUMMARY} 字以内归纳3-5点要点：\n\n{ck}"
+        )
+        c = oai.chat.completions.create(
+            model=SUMMARIZER_MODEL,
+            messages=[{"role": "system", "content": "中文输出；客观精炼。"},
+                      {"role": "user", "content": prompt}],
+        )
+        part_summaries.append((c.choices[0].message.content or "").strip())
+
+    # reduce 汇总
+    combined = "\n".join(f"- {s}" for s in part_summaries if s)
+    final_prompt = (
+        f"这是一份文档的分段要点，请在 600 字以内汇总为一份条理清晰的中文摘要，给出：\n"
+        f"1) 关键要点列表（5-8条）\n2) 关键结论（1-2句）\n\n分段要点：\n{combined}"
+    )
+    c2 = oai.chat.completions.create(
+        model=SUMMARIZER_MODEL,
+        messages=[{"role": "system", "content": "中文输出；保留事实细节，避免主观猜测。"},
+                  {"role": "user", "content": final_prompt}],
+    )
+    return (c2.choices[0].message.content or "").strip()
+
+def _to_data_url(image_bytes: bytes, content_type: str) -> str:
+    """
+    以 data URL 形式给视觉模型（无需外链）
+    """
+    ct = content_type or "image/png"
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{ct};base64,{b64}"
+
+async def _ocr_image_with_vision(image_bytes: bytes, content_type: str) -> str:
+    """
+    使用 OpenAI 视觉模型做 OCR+理解
+    """
+    data_url = _to_data_url(image_bytes, content_type)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": "请识别图片中的所有可读文字，并在需要时做简要总结；保留关键信息（人名、金额、时间）。中文输出。"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    c = oai.chat.completions.create(model=VISION_MODEL, messages=messages)
+    return (c.choices[0].message.content or "").strip()
+
+def _ocr_image_local(image_bytes: bytes) -> str:
+    """
+    本地 pytesseract OCR（需系统安装 tesseract，可在 Render 私有镜像中预装）
+    """
+    if not pytesseract or not Image:
+        return ""
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        txt = pytesseract.image_to_string(img, lang="chi_sim+eng")
+        return txt.strip()
+    except Exception as e:
+        logger.warning("local OCR failed: %s", e)
+        return ""
+
+async def _process_pdf_and_reply(from_user: str, pdf_bytes: bytes, filename: str):
+    text, pages = _pdf_extract_text(pdf_bytes)
+    if not text or len(text) < 50:
+        msg = (
+            f"收到 PDF：{filename or '(未命名)'}（{pages} 页）。"
+            f"\n但未能抽取到足够文本，可能是**扫描版**或加密 PDF。"
+            f"\n可尝试：\n- 发送每页截图/图片；或\n- 开启本地 OCR（LOCAL_OCR_ENABLE=true，并在系统安装 tesseract）。"
+        )
+        await send_text(from_user, msg)
+        return
+
+    summary = await _summarize_long_text(text, filename=filename or "")
+    # 附上基本信息
+    head = f"📄 《{filename or '未命名'}》 | 页数：{pages} | 抽取字数：{len(text)}"
+    out = head + "\n\n" + summary
+    await send_text(from_user, _smart_truncate(out, 3800))
+
+async def _process_image_and_reply(from_user: str, image_bytes: bytes, content_type: str, filename: Optional[str]):
+    if LOCAL_OCR_ENABLE:
+        txt = _ocr_image_local(image_bytes)
+        if txt and len(txt) > 20:
+            # 对 OCR 文本再做一次精炼
+            s = await _summarize_long_text(txt[:MAX_INPUT_CHARS], filename=filename or "")
+            out = f"🖼️ 图片（{filename or '未命名'}）OCR+摘要：\n\n{s}"
+            await send_text(from_user, _smart_truncate(out, 3800))
+            return
+        # 本地 OCR 不足时，回退到云端视觉
+        logger.warning("local OCR produced little text, fallback to vision model")
+
+    try:
+        v = await _ocr_image_with_vision(image_bytes, content_type or "image/png")
+        await send_text(from_user, _smart_truncate(f"🖼️ 图片解析：\n\n{v}", 3800))
+    except Exception as e:
+        logger.exception("vision ocr failed: %s", e)
+        await send_text(from_user, "（图片解析失败，可稍后再试，或关闭本地OCR并使用云端视觉）")
+
 # ========== 状态接口 ==========
 @app.get("/")
 async def root():
@@ -298,7 +495,6 @@ async def root():
             "web_search": {"enabled": WEB_SEARCH_ENABLE, "provider": WEB_PROVIDER},
         }
     )
-
 
 # ========== GET 校验（仍用 wechatpy）==========
 @app.get("/wecom/callback")
@@ -320,7 +516,6 @@ async def wecom_verify(request: Request):
         logger.error("wecom-app:URL verify decrypt failed: %s", e)
         return PlainTextResponse("invalid")
 
-
 # ========== 签名/解密工具 ==========
 def wecom_sign(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
     """
@@ -328,7 +523,6 @@ def wecom_sign(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
     """
     raw = "".join(sorted([token, str(timestamp), str(nonce), encrypt]))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
 
 def wecom_decrypt_raw(encrypt_b64: str, aes_key43: str, corp_id_or_suiteid: str) -> str:
     """
@@ -354,41 +548,37 @@ def wecom_decrypt_raw(encrypt_b64: str, aes_key43: str, corp_id_or_suiteid: str)
     plaintext = padded[:-pad]
 
     # 拆明文
-    # 0:16 随机串, 16:20 长度, 20:20+len 是 XML, 其后是 corp_id/suite_id
     msg_len = int.from_bytes(plaintext[16:20], "big")
     xml_bytes = plaintext[20:20 + msg_len]
     tail = plaintext[20 + msg_len:].decode("utf-8", "ignore")
 
-    # 校验 corp/suite id（放宽为包含，兼容第三方/自建应用）
+    # 校验 corp/suite id（放宽为包含）
     if corp_id_or_suiteid and (corp_id_or_suiteid not in tail):
         logger.warning("wecom decrypt: corp/suite id mismatch: in-xml=%s expected-like=%s", tail, corp_id_or_suiteid)
 
     return xml_bytes.decode("utf-8", "ignore")
 
-
-# ========== POST 业务处理（稳健解密）==========
+# ========== POST 业务处理（稳健解密 + PDF/图片解析）==========
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
     """
     业务消息处理（POST）
     安全模式：正则抽取 Encrypt -> 签名校验 -> AES-CBC 直解
     兼容明文模式：没有 Encrypt 时，直接解析原文
+    支持消息类型：text / image / file
     """
     params = dict(request.query_params)
     msg_signature = params.get("msg_signature", "")
     timestamp = params.get("timestamp", "")
     nonce = params.get("nonce", "")
 
-    # 读取原始 body（bytes）
+    # 读取原始 body
     raw = await request.body()
     if not raw:
         logger.error("wecom-app: empty body")
         return PlainTextResponse("success")
 
-    # 兼容 JSON 或 XML，从 body 中抽取 Encrypt：
-    #   <Encrypt><![CDATA[xxx]]></Encrypt>
-    #   <Encrypt>xxx</Encrypt>
-    #   "Encrypt":"xxx"
+    # 兼容 JSON 或 XML，从 body 中抽取 Encrypt
     m = re.search(
         rb"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>|<Encrypt>([^<]+)</Encrypt>|\"Encrypt\"\s*:\s*\"(.*?)\"",
         raw, re.S,
@@ -398,14 +588,14 @@ async def wecom_callback(request: Request):
         enc_bytes = next(g for g in m.groups() if g)
         encrypt = enc_bytes.decode("utf-8", "ignore")
 
-        # 企业微信签名校验（失败也仅告警，继续尝试解密便于定位问题）
+        # 签名校验（失败仅告警）
         calc_sig = wecom_sign(WECOM_TOKEN, timestamp, nonce, encrypt)
         if calc_sig != msg_signature:
             logger.warning("wecom-app: msg_signature mismatch: got=%s calc=%s", msg_signature, calc_sig)
 
         try:
             decrypted_xml = wecom_decrypt_raw(encrypt, WECOM_AES_KEY, WEWORK_CORP_ID)
-        except Exception as e:
+        except Exception:
             head = raw[:120].decode("utf-8", "ignore")
             logger.exception("wecom-app: decrypt failed via raw aes-cbc, head=%r", head)
             return PlainTextResponse("success")
@@ -416,7 +606,7 @@ async def wecom_callback(request: Request):
     # 解析“明文 XML”
     try:
         d = xmltodict.parse(decrypted_xml).get("xml", {})
-    except Exception as e:
+    except Exception:
         logger.exception("wecom-app: parse decrypted xml failed, xml_head=%r", decrypted_xml[:120])
         return PlainTextResponse("success")
 
@@ -424,21 +614,68 @@ async def wecom_callback(request: Request):
     from_user = d.get("FromUserName") or ""
     content = (d.get("Content") or "").strip()
 
-    # ---- 文本消息 ----
-    if msg_type == "text":
-        # /ping
-        if content.strip().lower().startswith("/ping"):
-            info = [
-                f"当前活跃模型：{PRIMARY_MODEL}",
-                f"候选列表：{', '.join([PRIMARY_MODEL] + FALLBACK_MODELS)}",
-                f"组织ID：{OPENAI_ORG_ID or '(未设)'}",
-                f"记忆：{MEMORY_BACKEND}",
-                f"联网搜索：{'on' if WEB_SEARCH_ENABLE else 'off'} / {WEB_PROVIDER}",
-            ]
-            await send_text(from_user, "\n".join(info))
+    # ---- ping 自检 ----
+    if msg_type == "text" and content.strip().lower().startswith("/ping"):
+        info = [
+            f"当前活跃模型：{PRIMARY_MODEL}",
+            f"候选列表：{', '.join([PRIMARY_MODEL] + FALLBACK_MODELS)}",
+            f"组织ID：{OPENAI_ORG_ID or '(未设)'}",
+            f"记忆：{MEMORY_BACKEND}",
+            f"联网搜索：{'on' if WEB_SEARCH_ENABLE else 'off'} / {WEB_PROVIDER}",
+            f"PDF/图片解析：已启用（LOCAL_OCR={'on' if LOCAL_OCR_ENABLE else 'off'}）",
+        ]
+        await send_text(from_user, "\n".join(info))
+        return PlainTextResponse("success")
+
+    # ---- Image 图片 ----
+    if msg_type == "image":
+        media_id = d.get("MediaId") or ""
+        if not media_id:
+            await send_text(from_user, "（未拿到图片 MediaId）")
+            return PlainTextResponse("success")
+        try:
+            data, ct, fn = await _download_wecom_media(media_id)
+        except Exception as e:
+            logger.exception("download image failed: %s", e)
+            await send_text(from_user, "（下载图片失败）")
             return PlainTextResponse("success")
 
-        # 联网搜索触发
+        await _process_image_and_reply(from_user, data, ct or "image/png", fn)
+        return PlainTextResponse("success")
+
+    # ---- File 文件（含 PDF）----
+    if msg_type == "file":
+        media_id = d.get("MediaId") or ""
+        filename = d.get("FileName") or ""
+        if not media_id:
+            await send_text(from_user, "（未拿到文件 MediaId）")
+            return PlainTextResponse("success")
+
+        try:
+            data, ct, suggest = await _download_wecom_media(media_id)
+            if not filename:
+                filename = suggest or ("file" + _guess_ext_from_ct(ct))
+        except Exception as e:
+            logger.exception("download file failed: %s", e)
+            await send_text(from_user, "（下载文件失败）")
+            return PlainTextResponse("success")
+
+        # PDF
+        if filename.lower().endswith(".pdf") or "pdf" in (ct or "").lower():
+            await _process_pdf_and_reply(from_user, data, filename)
+            return PlainTextResponse("success")
+
+        # 图片类文件（用户可能从文件选择里发图）
+        if _is_image_filename(filename):
+            await _process_image_and_reply(from_user, data, ct or "image/png", filename)
+            return PlainTextResponse("success")
+
+        await send_text(from_user, f"已收到文件：{filename}（暂只支持 PDF 与常见图片格式）。")
+        return PlainTextResponse("success")
+
+    # ---- 文本消息：搜索或闲聊 ----
+    if msg_type == "text":
+        # 联网搜索
         should_web, web_q = _want_web_route(content)
         if should_web:
             if not WEB_SEARCH_ENABLE:
@@ -453,7 +690,7 @@ async def wecom_callback(request: Request):
             await send_text(from_user, reply_text)
             return PlainTextResponse("success")
 
-        # ---- 普通对话：加载记忆 + 多模型回退 ----
+        # 普通对话（记忆 + 回退）
         try:
             history = []
             try:
@@ -468,10 +705,8 @@ async def wecom_callback(request: Request):
             models_try = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m]
             reply_text, used_model = await ask_models(messages, models_try)
 
-            # 发送
             await send_text(from_user, reply_text)
 
-            # 写记忆（不因 Redis 故障阻塞）
             try:
                 await memory.append(from_user, "user", content)
                 await memory.append(from_user, "assistant", reply_text)
@@ -479,11 +714,11 @@ async def wecom_callback(request: Request):
                 logger.warning("append memory failed: %s", e)
 
             return PlainTextResponse("success")
-        except Exception as e:
-            logger.exception("biz error: %s", e)
+        except Exception:
+            logger.exception("biz error")
             await send_text(from_user, "（服务端异常，可稍后再试或 /ping 自检）")
             return PlainTextResponse("success")
 
-    # ---- 其它类型（图片/文件等，后续扩展 PDF/图片解析）----
-    await send_text(from_user, "已收到消息（当前仅支持文本提问；文件/PDF/图片解析已接入变量与占位，稍后完善）。")
+    # ---- 其它消息类型（语音/视频/事件等）----
+    await send_text(from_user, "已收到消息（当前支持：文本、图片、PDF）。")
     return PlainTextResponse("success")
