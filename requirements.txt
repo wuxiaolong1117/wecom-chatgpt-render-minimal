@@ -10,13 +10,13 @@ openai>=1.35.0,<2.0.0
 
 # 企业微信 SDK（带企业加密能力）
 xmltodict==0.13.0
+wechatpy==1.8.18
+cryptography>=41.0.0
 
 
 # 会话记忆（可选：若 CHAT_MEMORY=redis）
 redis>=5.0.1,<6.0.0
 
-# 加解密（WeCom 安全模式需要）
-cryptography>=42.0.0,<44.0.0
 
 # 上传解析等（可选，FastAPI 处理表单/文件时需要）
 python-multipart>=0.0.9,<0.0.10
