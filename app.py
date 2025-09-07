@@ -323,92 +323,125 @@ async def wecom_verify(request: Request):
 
 
 from fastapi import Request
-from starlette.responses import PlainTextResponse
+# 顶部 import（如已存在可跳过）
 import re, json, gzip, zlib
+from starlette.responses import PlainTextResponse
+
+def _head_preview(s: str) -> str:
+    return re.sub(r"[\r\n\t ]+", " ", (s or "")[:120])
+
+def _ensure_xml_for_wechatpy(body_text: str) -> tuple[str, str]:
+    """
+    让任意形态的 body 变成 wechatpy.decrypt_message 所需 XML。
+    返回: (xml_string, how)；xml_string 为空说明失败。
+    """
+    t = (body_text or "").lstrip("\ufeff").strip()
+    if not t:
+        return "", "empty"
+
+    # 1) JSON -> 构造 xml
+    if t.startswith("{"):
+        try:
+            obj = json.loads(t)
+            enc = obj.get("Encrypt") or obj.get("encrypt") or ""
+            tou = obj.get("ToUserName") or obj.get("to_user_name") or ""
+            if enc:
+                xml = f"<xml><ToUserName><![CDATA[{tou}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+                return xml, "json→xml"
+        except Exception as e:
+            return "", f"json error: {e}"
+
+    # 2) 原本就是 XML
+    if t.startswith("<"):
+        # 已包含 Encrypt 就直接交给 wechatpy
+        if ("<Encrypt>" in t) or ("<Encrypt><![CDATA[" in t):
+            return t, "xml"
+        # 没有 Encrypt，尝试从 XML 内抢救
+        m = re.search(r"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", t, re.S)
+        if m:
+            enc = m.group(1)
+            xml = f"<xml><ToUserName><![CDATA[]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+            return xml, "xml-salvaged"
+
+    # 3) 杂形态：urlencoded / 代理前缀/文本包裹等，尽力提取 Encrypt
+    m = (re.search(r'"Encrypt"\s*:\s*"([^"]+)"', t) or
+         re.search(r"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", t, re.S) or
+         re.search(r"encrypt=([A-Za-z0-9+/=]+)", t))
+    if m:
+        enc = m.group(1)
+        xml = f"<xml><ToUserName><![CDATA[]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+        return xml, "regex-salvaged"
+
+    return "", "no-encrypt-field"
 
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
-    # --------- query ---------
+    # 1) query
     msg_signature = request.query_params.get("msg_signature")
     timestamp     = request.query_params.get("timestamp")
     nonce         = request.query_params.get("nonce")
 
-    # --------- body（只读一次）---------
+    # 2) 读 body（只读一次） + 解压 + 去 BOM
     raw = await request.body()
-    enc = (request.headers.get("Content-Encoding") or "").lower()
+    enc_hdr = (request.headers.get("Content-Encoding") or "").lower()
     try:
-        if enc == "gzip":
+        if enc_hdr == "gzip":
             raw = gzip.decompress(raw)
-        elif enc == "deflate":
+        elif enc_hdr == "deflate":
             raw = zlib.decompress(raw, -zlib.MAX_WBITS)
     except Exception as e:
-        logger.warning("safe-mode: decompress fail enc=%s err=%s", enc, e)
-
+        logger.warning("safe-mode: decompress fail enc=%s err=%s", enc_hdr, e)
     text = raw.decode("utf-8", "ignore").lstrip("\ufeff").strip()
 
-    def head_preview(s: str) -> str:
-        h = re.sub(r"[\r\n\t ]+", " ", s[:120])
-        return h
-
-    # --------- 解析容错：安全模式 or 明文模式 ----------
-    data = {}
+    # 是否安全模式：有签名 + AES_KEY
     is_safe_mode = bool(msg_signature and (WECOM_AES_KEY or "").strip())
 
+    data = {}
     if is_safe_mode:
         if WeChatCrypto is None:
             logger.error("decrypt fail: wechatpy not installed")
             return PlainTextResponse("success")
 
-        # 1) 有些后台配置成 JSON，这里转换为 wechatpy 需要的 XML
-        payload_for_wechatpy = text
-        if text.startswith("{"):
-            try:
-                obj = json.loads(text)
-                tou = obj.get("ToUserName", "") or ""
-                enc = obj.get("Encrypt", "") or ""
-                payload_for_wechatpy = f"<xml><ToUserName><![CDATA[{tou}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
-                logger.info("safe-mode: got JSON, converted to XML for wechatpy. head=%r", head_preview(payload_for_wechatpy))
-            except Exception as e:
-                logger.warning("safe-mode: json parse fail: %s, head=%r", e, head_preview(text))
-                return PlainTextResponse("success")
-        else:
-            # 如果不是以 < 开头，基本就不是 XML
-            if not payload_for_wechatpy.startswith("<"):
-                logger.error("safe-mode: body is not xml. head=%r", head_preview(payload_for_wechatpy))
-                return PlainTextResponse("success")
+        # 将 body 统一整理成 wechatpy 需要的 XML
+        xml_for_wechatpy, how = _ensure_xml_for_wechatpy(text)
+        if not xml_for_wechatpy:
+            logger.error(
+                "safe-mode: cannot convert body to xml (%s); head=%r; ct=%s",
+                how, _head_preview(text), request.headers.get("Content-Type")
+            )
+            return PlainTextResponse("success")
 
-        # 2) 解密
+        logger.info("safe-mode: using payload (%s); head=%r", how, _head_preview(xml_for_wechatpy))
+
+        # 解密
         try:
             crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
             decrypted_xml = crypto.decrypt_message(
-                msg_signature, timestamp, nonce, payload_for_wechatpy
+                msg_signature, timestamp, nonce, xml_for_wechatpy
             )
         except Exception:
             logger.exception("ERROR:wecom-app:decrypt fail (safe-mode)")
             return PlainTextResponse("success")
 
-        # 3) 解析解密后的 XML
+        # 解析解密后 XML
         try:
             data = xmltodict.parse(to_text(decrypted_xml)).get("xml", {})
         except Exception:
-            logger.exception("safe-mode: parse decrypted xml fail. head=%r", head_preview(to_text(decrypted_xml)))
+            logger.exception("safe-mode: parse decrypted xml fail. head=%r", _head_preview(to_text(decrypted_xml)))
             return PlainTextResponse("success")
 
     else:
         # 明文模式
-        if not text:
-            logger.warning("plain-mode: empty body")
-            return PlainTextResponse("success")
-        if not text.startswith("<"):
-            logger.warning("plain-mode: body not xml. head=%r", head_preview(text))
+        if not text or not text.startswith("<"):
+            logger.warning("plain-mode: body not xml. head=%r", _head_preview(text))
             return PlainTextResponse("success")
         try:
             data = xmltodict.parse(text).get("xml", {})
         except Exception:
-            logger.exception("plain-mode: parse xml fail. head=%r", head_preview(text))
+            logger.exception("plain-mode: parse xml fail. head=%r", _head_preview(text))
             return PlainTextResponse("success")
 
-    # --------- 业务处理（以下保持你原逻辑）---------
+    # ---------- 以下继续你原来的业务逻辑 ----------
     msg_type  = (data.get("MsgType") or "").lower()
     from_user = data.get("FromUserName") or ""
     content   = (data.get("Content") or "").strip()
@@ -419,8 +452,7 @@ async def wecom_callback(request: Request):
         await send_text(from_user, "pong")
         return PlainTextResponse("success")
 
-    # 继续你的处理：指令/LLM/PDF/图片…
-    # reply_text = await handle_message(msg_type, content, pic_url, media_id, data)
+    # .... 继续你的指令/LLM/PDF/图片逻辑
+    # reply_text = await handle_message(...)
     # await send_text(from_user, reply_text)
-
     return PlainTextResponse("success")
