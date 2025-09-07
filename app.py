@@ -1,494 +1,489 @@
-# app.py
+# -*- coding: utf-8 -*-
 import os
-import io
+import re
 import json
-import base64
+import time
 import asyncio
 import logging
-from typing import Optional, Tuple, List
+import base64
+import hashlib
+from typing import Dict, List, Tuple, Optional
 
 import httpx
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import JSONResponse, PlainTextResponse
+import xmltodict
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
+
+# === OpenAI v1 SDK ===
 from openai import OpenAI
 
-# ---------- WeCom / XML ----------
+# === WeCom 加解密（仅保留 GET 校验用）===
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
-import xmltodict
+from xml.parsers.expat import ExpatError
 
-# ---------- 文档/图像 ----------
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
+# === AES-CBC 直解依赖 ===
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
-# ---------- 记忆（可选 Redis） ----------
-import redis
-
-# ---------- 日志 ----------
+# ========== 日志 ==========
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("wecom-app")
+logger = logging.getLogger("wecom-app")
 
-# =========================================================
-# 环境变量
-# =========================================================
+# ========== 环境变量 ==========
+# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")  # 组织 ID（可选，但你已验证，就显式带上）
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "gpt-5")
-MODEL_BACKUP = os.getenv("MODEL_BACKUP", "gpt-5-mini")
-MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "gpt-4o-mini")
-
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
-SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
-
-LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() in ("true", "1", "on")
-MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "150000"))
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "4000"))
-CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "800"))
-
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
-WEB_SEARCH_ENABLE = os.getenv("WEB_SEARCH_ENABLE", "on").lower() in ("on", "true", "1")
-
-# WeCom
-WECOM_CORP_ID = os.getenv("WEWORK_CORP_ID") or os.getenv("WECOM_CORP_ID", "")
-WECOM_SECRET = os.getenv("WEWORK_SECRET") or os.getenv("WECOM_SECRET", "")
-WECOM_AGENT_ID = os.getenv("WEWORK_AGENT_ID") or os.getenv("WECOM_AGENT_ID", "")
-WECOM_TOKEN = os.getenv("WECOM_TOKEN", "")
-WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
-SAFE_MODE = os.getenv("SAFE_MODE", "true").lower() in ("true", "on", "1")
+# 模型与回退
+PRIMARY_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
+FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("OPENAI_MODEL_FALLBACKS", "gpt-5-mini,gpt-4o-mini").split(",") if m.strip()
+]
 
 # 记忆
-MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "memory")  # memory / redis
-REDIS_URL = os.getenv("REDIS_URL", "redis://host:6379/0")
-SESSION_TTL = int(os.getenv("SESSION_TTL", "86400"))
+MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "memory").lower()  # redis/memory
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# 其它
-SEND_MAX_LEN = int(os.getenv("SEND_MAX_LEN", "1900"))  # 企业微信文字长度安全阈值
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+# WeCom
+WEWORK_CORP_ID = os.getenv("WEWORK_CORP_ID", "")
+WEWORK_AGENT_ID = os.getenv("WEWORK_AGENT_ID", "")
+WEWORK_SECRET = os.getenv("WEWORK_SECRET", "")
+WECOM_TOKEN = os.getenv("WECOM_TOKEN", "")
+WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
 
-# =========================================================
-# OpenAI Client
-# =========================================================
+# 安全模式兼容与解密降级
+WECOM_SAFE_MODE = os.getenv("WECOM_SAFE_MODE", "true").lower() == "true"
+
+# PDF/图片摘要相关（占位，后续扩展）
+SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() == "true"
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
+CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "400"))
+
+# 联网搜索（SerpAPI）
+WEB_SEARCH_ENABLE = os.getenv("WEB_SEARCH_ENABLE", "false").lower() == "true"
+WEB_PROVIDER = os.getenv("WEB_PROVIDER", "serpapi").lower()  # serpapi / cse
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")
+GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "")
+
+# ========== OpenAI 客户端 ==========
 oai = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    organization=(OPENAI_ORG_ID or None),  # 显式组织 ID
+    organization=OPENAI_ORG_ID or None,  # 显式带上组织
 )
 
-# =========================================================
-# FastAPI
-# =========================================================
+# ========== FastAPI ==========
 app = FastAPI()
 
-# =========================================================
-# 记忆实现
-# =========================================================
-class MemoryStore:
-    def __init__(self):
-        self.r = None
-        self.mem: dict[str, List[dict]] = {}
-        if MEMORY_BACKEND == "redis":
-            try:
-                self.r = redis.from_url(REDIS_URL)
-                self.r.ping()
-                log.info("memory: redis enabled")
-            except Exception as e:
-                log.warning(f"memory: redis connect fail: {e}, fallback to memory")
-                self.r = None
+# ========== 记忆实现（内存 + Redis 兼容） ==========
+class MemoryBase:
+    async def load(self, uid: str) -> List[Dict]:
+        raise NotImplementedError
 
-    def _key(self, user_id: str) -> str:
-        return f"wecom:session:{user_id}"
+    async def append(self, uid: str, role: str, content: str):
+        raise NotImplementedError
 
-    def load(self, user_id: str) -> List[dict]:
+
+class InMemory(MemoryBase):
+    def __init__(self, limit=12):
+        self.store: Dict[str, List[Dict]] = {}
+        self.limit = limit
+
+    async def load(self, uid: str) -> List[Dict]:
+        return self.store.get(uid, [])
+
+    async def append(self, uid: str, role: str, content: str):
+        arr = self.store.setdefault(uid, [])
+        arr.append({"role": role, "content": content})
+        if len(arr) > self.limit:
+            self.store[uid] = arr[-self.limit :]
+
+
+class RedisMemory(MemoryBase):
+    def __init__(self, url: str, limit=12, namespace="mem:"):
+        self.url = url
+        self.limit = limit
+        self.ns = namespace
         try:
-            if self.r:
-                raw = self.r.get(self._key(user_id))
-                if raw:
-                    return json.loads(raw)
-                return []
-            return self.mem.get(user_id, [])
+            import redis.asyncio as redis  # type: ignore
+            self.r = redis.from_url(self.url, decode_responses=True)
         except Exception as e:
-            log.warning(f"load memory failed: {e}")
-            return []
+            logger.warning("Redis init failed: %s", e)
+            self.r = None
 
-    def save(self, user_id: str, messages: List[dict]):
-        try:
-            if self.r:
-                self.r.setex(self._key(user_id), SESSION_TTL, json.dumps(messages, ensure_ascii=False))
-            else:
-                self.mem[user_id] = messages
-        except Exception as e:
-            log.warning(f"append memory failed: {e}")
+    async def load(self, uid: str) -> List[Dict]:
+        if not self.r:
+            raise RuntimeError("Redis not ready")
+        key = f"{self.ns}{uid}"
+        data = await self.r.get(key)
+        return json.loads(data) if data else []
 
-memory = MemoryStore()
+    async def append(self, uid: str, role: str, content: str):
+        if not self.r:
+            raise RuntimeError("Redis not ready")
+        key = f"{self.ns}{uid}"
+        data = await self.r.get(key)
+        arr = json.loads(data) if data else []
+        arr.append({"role": role, "content": content})
+        if len(arr) > self.limit:
+            arr = arr[-self.limit :]
+        await self.r.set(key, json.dumps(arr), ex=60 * 60 * 24 * 7)
 
-# =========================================================
-# WeCom API
-# =========================================================
+
+if MEMORY_BACKEND == "redis":
+    memory: MemoryBase = RedisMemory(REDIS_URL)
+else:
+    memory = InMemory()
+
+# ========== WeCom 发送/鉴权 ==========
+_token_cache = {"value": "", "expire": 0}
+
+
 async def get_wecom_token() -> str:
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_SECRET}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    now = time.time()
+    if _token_cache["value"] and _token_cache["expire"] > now + 30:
+        return _token_cache["value"]
+    url = (
+        f"https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+        f"?corpid={WEWORK_CORP_ID}&corpsecret={WEWORK_SECRET}"
+    )
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url)
+        r.raise_for_status()
         data = r.json()
-        return data["access_token"]
+        tok = data.get("access_token", "")
+        exp = int(data.get("expires_in", 7200))
+        _token_cache["value"] = tok
+        _token_cache["expire"] = now + exp - 60
+        return tok
+
 
 async def send_text(to_user: str, content: str):
+    # 避免 44004 空文本
+    txt = (content or "").strip()
+    if not txt:
+        txt = "（模型未输出可读文本，建议换个问法，或发送 /ping 自检出站链路。）"
+    payload = {
+        "touser": to_user,
+        "msgtype": "text",
+        "agentid": int(WEWORK_AGENT_ID),
+        "text": {"content": txt[:4096]},  # 企微单条上限
+        "safe": 0,
+    }
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-
-    # 分片发送
-    chunks: List[str] = []
-    text = (content or "").strip() or "（空）"
-    while len(text) > SEND_MAX_LEN:
-        chunks.append(text[:SEND_MAX_LEN])
-        text = text[SEND_MAX_LEN:]
-    chunks.append(text)
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        for chunk in chunks:
-            payload = {
-                "touser": to_user,
-                "msgtype": "text",
-                "agentid": int(WECOM_AGENT_ID),
-                "text": {"content": chunk},
-                "safe": 0,
-            }
-            r = await client.post(url, json=payload)
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.post(url, json=payload)
+        try:
             data = r.json()
-            log.warning(f"WeCom send result -> to={to_user} payload_len={len(chunk)} resp={data}")
-
-            # 44004 空文本保护
+        except Exception:
+            data = {"errcode": -1, "errmsg": "json decode error"}
+        logger.warning("WeCom send result -> to=%s payload_len=%s resp=%s", to_user, len(txt), data)
+        if data.get("errcode") != 0:
+            # 再试一次（常见 44004）
             if data.get("errcode") == 44004:
-                payload["text"]["content"] = "（模型未输出文本，建议换个问法或稍后重试）"
-                await client.post(url, json=payload)
+                payload["text"]["content"] = "（消息过短或被过滤，已替换为占位文本。）"
+                r2 = await client.post(url, json=payload)
+                logger.warning("WeCom send first attempt failed: %s, retrying...", data)
+                return r2.json()
+            raise RuntimeError(f"WeCom send err: {data}")
+        return data
 
-async def download_wecom_media(media_id: str) -> Tuple[bytes, str]:
-    token = await get_wecom_token()
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url)
-        ct = r.headers.get("Content-Type", "")
-        return r.content, ct
 
-# =========================================================
-# OCR & PDF 解析
-# =========================================================
-def _local_ocr(image_bytes: bytes) -> str:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(img, lang="chi_sim+eng")
-        return (text or "").strip()
-    except Exception as e:
-        log.warning(f"local ocr fail: {e}")
-        return ""
+# ========== 文本清洗与触发 ==========
+def _normalize_text(t: str) -> str:
+    t = (t or "").strip()
+    t = t.replace("／", "/").replace("：", ":")
+    t = re.sub(r"\s+", " ", t)
+    return t
 
-async def _vision_ocr(image_bytes: bytes) -> str:
-    b64 = base64.b64encode(image_bytes).decode()
-    try:
-        resp = oai.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "从图片中提取所有可见文字，按自然段返回，不要解释。"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}" }},
-                ],
-            }],
-            max_completion_tokens=1024,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        log.warning(f"vision ocr fail: {e}")
-        return ""
 
-async def ocr_image(image_bytes: bytes) -> str:
-    if LOCAL_OCR_ENABLE:
-        txt = _local_ocr(image_bytes)
-        if txt:
-            return txt
-    return await _vision_ocr(image_bytes)
+def _want_web_route(t: str) -> Tuple[bool, str]:
+    """
+    触发词：
+      /web
+      web <query>
+      search: <query>
+      search <query>
+      搜索: <query> / 搜索：<query>
+    """
+    s = _normalize_text(t).lower()
+    raw = _normalize_text(t)
+    prefixes = ["/web", "web ", "search:", "search ", "搜索:", "搜索："]
+    for p in prefixes:
+        if s.startswith(p):
+            q = raw[len(p):].strip()
+            return True, q
+    return False, raw
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts: List[str] = []
-    for page in doc:
-        txt = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)
-        txt = (txt or "").strip()
-        if len(txt) < 20 and LOCAL_OCR_ENABLE:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_bytes = pix.tobytes("png")
-            txt = _local_ocr(img_bytes) or ""
-        parts.append(txt)
-    text = "\n\n".join([p for p in parts if p])
-    return text[:MAX_INPUT_CHARS]
 
-# =========================================================
-# 文本分块摘要
-# =========================================================
-async def summarize_long_text(raw_text: str, system_prompt: str = "你是专业的文档助理。") -> str:
-    text = (raw_text or "").strip()
-    if not text:
-        return "（未从文件中提取到可读文字）"
-
-    # 单段
-    if len(text) <= CHUNK_SIZE:
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请用要点+结论总结（150-300字）：\n{text}"},
+async def _web_search_serpapi(query: str, k: int = 5):
+    if not SERPAPI_KEY:
+        raise RuntimeError("SERPAPI_KEY missing")
+    params = {
+        "engine": "google",
+        "q": query,
+        "hl": "zh-cn",
+        "gl": "cn",
+        "num": k,
+        "api_key": SERPAPI_KEY,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get("https://serpapi.com/search.json", params=params)
+        r.raise_for_status()
+        items = r.json().get("organic_results", [])
+        return [
+            {
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "snippet": it.get("snippet", ""),
+            }
+            for it in items
         ]
-        for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
-            try:
-                kwargs = dict(model=m, messages=msgs)
-                if m.startswith("gpt-5"):
-                    kwargs["max_completion_tokens"] = CHUNK_SUMMARY
-                else:
-                    kwargs["max_tokens"] = CHUNK_SUMMARY
-                    kwargs["temperature"] = 1
-                resp = oai.chat.completions.create(**kwargs)
-                out = (resp.choices[0].message.content or "").strip()
-                if out:
-                    return out
-            except Exception as e:
-                log.warning(f"summarize fail {m}: {e}")
-        return "（摘要失败）"
 
-    # 多段
-    chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-    bullets: List[str] = []
-    for idx, ck in enumerate(chunks, 1):
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"第{idx}/{len(chunks)}段，提取3-5条要点，保留关键数字/名词：\n{ck}"},
-        ]
-        piece = ""
-        for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
-            try:
-                kwargs = dict(model=m, messages=msgs)
-                if m.startswith("gpt-5"):
-                    kwargs["max_completion_tokens"] = CHUNK_SUMMARY
-                else:
-                    kwargs["max_tokens"] = CHUNK_SUMMARY
-                    kwargs["temperature"] = 1
-                resp = oai.chat.completions.create(**kwargs)
-                piece = (resp.choices[0].message.content or "").strip()
-                if piece:
-                    break
-            except Exception as e:
-                log.warning(f"chunk summarize fail {m}: {e}")
-        if piece:
-            bullets.append(f"- {piece}")
 
-    join_text = "\n".join(bullets)[:MAX_INPUT_CHARS]
-    msgs = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"以下为各段要点，请合并去重并给出‘结论/建议’：\n{join_text}"},
-    ]
-    for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
+def _render_search(items, provider="serpapi") -> str:
+    if not items:
+        return "（联网搜索没有检索到结果，换个关键词或加上地点/时间再试）"
+    out = [f"🔎 已联网搜索（{provider}）："]
+    for i, it in enumerate(items[:5], 1):
+        title = it.get("title") or ""
+        url = it.get("url") or ""
+        out.append(f"[{i}] {title}\n{url}")
+    return "\n".join(out)
+
+
+# ========== OpenAI 对话（主模型 + 回退） ==========
+async def ask_models(messages: List[Dict], models: List[str]) -> Tuple[str, str]:
+    """
+    依次尝试模型，返回 (reply_text, used_model)
+    - gpt-5 / gpt-5-mini 不要传 temperature / max_tokens（只用默认）
+    """
+    for m in models:
         try:
-            kwargs = dict(model=m, messages=msgs)
-            if m.startswith("gpt-5"):
-                kwargs["max_completion_tokens"] = CHUNK_SUMMARY
+            completion = oai.chat.completions.create(
+                model=m,
+                messages=messages,
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if text:
+                return text, m
             else:
-                kwargs["max_tokens"] = CHUNK_SUMMARY
-                kwargs["temperature"] = 1
-            resp = oai.chat.completions.create(**kwargs)
-            out = (resp.choices[0].message.content or "").strip()
-            if out:
-                return out
+                logger.warning("primary model %s failed: empty content from primary model", m)
         except Exception as e:
-            log.warning(f"final summarize fail {m}: {e}")
-    return "（汇总失败）"
+            logger.error("OpenAI call failed for %s: %s", m, e)
+    return "（模型临时没有返回内容，建议换个说法或稍后再试）", models[-1] if models else "unknown"
 
-# =========================================================
-# SerpAPI 搜索
-# =========================================================
-async def serp_search(q: str) -> str:
-    if not (WEB_SEARCH_ENABLE and SERPAPI_API_KEY):
-        return "（未配置 SerpAPI，或已关闭联网）"
-    params = {"engine": "google", "q": q, "api_key": SERPAPI_API_KEY, "num": 5, "hl": "zh-cn"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get("https://serpapi.com/search", params=params)
-        data = r.json()
-    links = []
-    for item in (data.get("organic_results") or [])[:5]:
-        title = item.get("title") or item.get("displayed_link") or "结果"
-        link = item.get("link") or ""
-        links.append(f"[{title}]\n{link}")
-    return "🔎 已联网搜索（serpapi）：\n" + ("\n\n".join(links) if links else "（没有搜到可用结果）")
 
-# =========================================================
-# Chat（含兜底链）
-# =========================================================
-async def chat_with_models(messages: List[dict], max_out: int = 512) -> str:
-    for m in (MODEL_PRIMARY, MODEL_BACKUP, MODEL_FALLBACK):
-        try:
-            kwargs = dict(model=m, messages=messages)
-            if m.startswith("gpt-5"):
-                kwargs["max_completion_tokens"] = max_out
-            else:
-                kwargs["max_tokens"] = max_out
-                kwargs["temperature"] = 1
-            resp = oai.chat.completions.create(**kwargs)
-            out = (resp.choices[0].message.content or "").strip()
-            if out:
-                return out
-            log.warning(f"model {m} returned empty content")
-        except Exception as e:
-            log.warning(f"model {m} call fail: {e}")
-    return "（模型临时没有返回内容，建议换个说法或稍后重试）"
-
-# =========================================================
-# 工具：清洗/重建 XML 以处理 ExpatError
-# =========================================================
-def clean_xml_payload(raw: str) -> str:
-    if not raw:
-        return ""
-    s = raw.lstrip("\ufeff \t\r\n")
-    i = s.find("<")
-    if i > 0:
-        s = s[i:]
-    # 只保留到最后一个 '>'（去尾部脏字节）
-    j = s.rfind(">")
-    if j >= 0:
-        s = s[:j+1]
-    return s
-
-# =========================================================
-# 路由
-# =========================================================
+# ========== 状态接口 ==========
 @app.get("/")
 async def root():
-    return JSONResponse({
-        "status": "ok",
-        "service": "WeCom + ChatGPT",
-        "model": f"{MODEL_PRIMARY},{MODEL_BACKUP},{MODEL_FALLBACK}",
-        "memory": MEMORY_BACKEND,
-        "web_search": "on/serpapi" if WEB_SEARCH_ENABLE else "off",
-        "pdf_image": "enabled",
-        "local_ocr": LOCAL_OCR_ENABLE,
-    })
+    return JSONResponse(
+        {
+            "status": "ok",
+            "mode": "safe" if WECOM_SAFE_MODE else "plain",
+            "service": "WeCom + ChatGPT",
+            "model": PRIMARY_MODEL,
+            "fallbacks": FALLBACK_MODELS,
+            "organization": OPENAI_ORG_ID or "",
+            "memory": MEMORY_BACKEND,
+            "pdf_support": True,
+            "local_ocr": LOCAL_OCR_ENABLE,
+            "web_search": {"enabled": WEB_SEARCH_ENABLE, "provider": WEB_PROVIDER},
+        }
+    )
 
-# 企业微信 URL 验证（GET）
+
+# ========== GET 校验（仍用 wechatpy）==========
 @app.get("/wecom/callback")
-async def wecom_verify(
-    msg_signature: str = Query(""),
-    timestamp: str = Query(""),
-    nonce: str = Query(""),
-    echostr: str = Query("")
-):
+async def wecom_verify(request: Request):
+    """
+    企业微信“接收消息服务器配置”校验；GET 验证回显
+    """
+    params = dict(request.query_params)
+    msg_signature = params.get("msg_signature", "")
+    timestamp = params.get("timestamp", "")
+    nonce = params.get("nonce", "")
+    echostr = params.get("echostr", "")
+
+    crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
     try:
-        crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WECOM_CORP_ID)
         echo = crypto.decrypt_message(msg_signature, timestamp, nonce, echostr)
-        echo = to_text(xmltodict.parse(to_text(echo))["xml"]["EchoStr"])
         return PlainTextResponse(echo)
     except Exception as e:
-        log.error(f"URL verify decrypt failed: {e}")
-        return PlainTextResponse("error", status_code=400)
+        logger.error("wecom-app:URL verify decrypt failed: %s", e)
+        return PlainTextResponse("invalid")
 
-# 企业微信消息回调（POST）
+
+# ========== 签名/解密工具 ==========
+def wecom_sign(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
+    """
+    企业微信签名算法：对 [token, timestamp, nonce, encrypt] 字符串数组做字典序排序后拼接，取 SHA1 十六进制。
+    """
+    raw = "".join(sorted([token, str(timestamp), str(nonce), encrypt]))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def wecom_decrypt_raw(encrypt_b64: str, aes_key43: str, corp_id_or_suiteid: str) -> str:
+    """
+    直接按企业微信规范对 Encrypt 字段做 AES-CBC 解密：
+    - key = Base64_Decode(aes_key43 + "=")
+    - iv  = key[:16]
+    - 明文结构 = 16字节随机 + 4字节网络序msg_len + msg_xml + corp_id/suite_id
+    """
+    if not aes_key43 or len(aes_key43) != 43:
+        logger.warning("WECOM_AES_KEY length is not 43, actual=%s", len(aes_key43) if aes_key43 else 0)
+    key = base64.b64decode((aes_key43 or "") + "=")
+    iv = key[:16]
+    ct = base64.b64decode(encrypt_b64)
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+
+    # PKCS#7 去填充
+    pad = padded[-1]
+    if pad < 1 or pad > 32:
+        raise ValueError(f"bad padding: {pad}")
+    plaintext = padded[:-pad]
+
+    # 拆明文
+    # 0:16 随机串, 16:20 长度, 20:20+len 是 XML, 其后是 corp_id/suite_id
+    msg_len = int.from_bytes(plaintext[16:20], "big")
+    xml_bytes = plaintext[20:20 + msg_len]
+    tail = plaintext[20 + msg_len:].decode("utf-8", "ignore")
+
+    # 校验 corp/suite id（放宽为包含，兼容第三方/自建应用）
+    if corp_id_or_suiteid and (corp_id_or_suiteid not in tail):
+        logger.warning("wecom decrypt: corp/suite id mismatch: in-xml=%s expected-like=%s", tail, corp_id_or_suiteid)
+
+    return xml_bytes.decode("utf-8", "ignore")
+
+
+# ========== POST 业务处理（稳健解密）==========
 @app.post("/wecom/callback")
-async def wecom_callback(
-    request: Request,
-    msg_signature: str = Query(""),
-    timestamp: str = Query(""),
-    nonce: str = Query("")
-):
-    body_bytes = await request.body()
-    xml_text = body_bytes.decode("utf-8", errors="ignore") if SAFE_MODE else body_bytes  # safe-mode 走 str
+async def wecom_callback(request: Request):
+    """
+    业务消息处理（POST）
+    安全模式：正则抽取 Encrypt -> 签名校验 -> AES-CBC 直解
+    兼容明文模式：没有 Encrypt 时，直接解析原文
+    """
+    params = dict(request.query_params)
+    msg_signature = params.get("msg_signature", "")
+    timestamp = params.get("timestamp", "")
+    nonce = params.get("nonce", "")
 
-    # 先尝试解密
+    # 读取原始 body（bytes）
+    raw = await request.body()
+    if not raw:
+        logger.error("wecom-app: empty body")
+        return PlainTextResponse("success")
+
+    # 兼容 JSON 或 XML，从 body 中抽取 Encrypt：
+    #   <Encrypt><![CDATA[xxx]]></Encrypt>
+    #   <Encrypt>xxx</Encrypt>
+    #   "Encrypt":"xxx"
+    m = re.search(
+        rb"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>|<Encrypt>([^<]+)</Encrypt>|\"Encrypt\"\s*:\s*\"(.*?)\"",
+        raw, re.S,
+    )
+
+    if m:
+        enc_bytes = next(g for g in m.groups() if g)
+        encrypt = enc_bytes.decode("utf-8", "ignore")
+
+        # 企业微信签名校验（失败也仅告警，继续尝试解密便于定位问题）
+        calc_sig = wecom_sign(WECOM_TOKEN, timestamp, nonce, encrypt)
+        if calc_sig != msg_signature:
+            logger.warning("wecom-app: msg_signature mismatch: got=%s calc=%s", msg_signature, calc_sig)
+
+        try:
+            decrypted_xml = wecom_decrypt_raw(encrypt, WECOM_AES_KEY, WEWORK_CORP_ID)
+        except Exception as e:
+            head = raw[:120].decode("utf-8", "ignore")
+            logger.exception("wecom-app: decrypt failed via raw aes-cbc, head=%r", head)
+            return PlainTextResponse("success")
+    else:
+        # 无 Encrypt：当作明文模式
+        decrypted_xml = raw.decode("utf-8", "ignore").strip()
+
+    # 解析“明文 XML”
     try:
-        crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WECOM_CORP_ID)
-        decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, xml_text)
-        msg = xmltodict.parse(to_text(decrypted_xml))["xml"]
+        d = xmltodict.parse(decrypted_xml).get("xml", {})
     except Exception as e:
-        # 解密失败：尝试清洗后的明文 XML（企业微信偶发明文/前后带脏字节）
-        log.error(f"ERROR:wecom-app:decrypt fail (safe-mode): {e}")
-        try:
-            cleaned = clean_xml_payload(xml_text)
-            log.warning(f"safe-mode: using cleaned payload; head='{cleaned[:120]}'")
-            msg = xmltodict.parse(to_text(cleaned))["xml"]
-        except Exception as e2:
-            log.error(f"decrypt retry fail: {e2}")
-            return PlainTextResponse("success")  # 一律返回 success，避免企业微信重试风暴
+        logger.exception("wecom-app: parse decrypted xml failed, xml_head=%r", decrypted_xml[:120])
+        return PlainTextResponse("success")
 
-    to_user = msg.get("ToUserName", "")
-    from_user = msg.get("FromUserName", "")
-    msg_type = (msg.get("MsgType") or "").lower()
+    msg_type = (d.get("MsgType") or "").lower()
+    from_user = d.get("FromUserName") or ""
+    content = (d.get("Content") or "").strip()
 
-    # ---------- 文本 ----------
+    # ---- 文本消息 ----
     if msg_type == "text":
-        content = (msg.get("Content") or "").strip()
-
-        if content == "/ping":
-            info = (
-                f"当前活跃模型：{MODEL_PRIMARY}\n"
-                f"候选列表：{MODEL_PRIMARY}, {MODEL_BACKUP}, {MODEL_FALLBACK}\n"
-                f"组织ID：{OPENAI_ORG_ID or '-'}\n"
-                f"记忆：{MEMORY_BACKEND}\n"
-                f"联网搜索：{'on/serpapi' if (WEB_SEARCH_ENABLE and SERPAPI_API_KEY) else 'off'}\n"
-                f"PDF/图片解析：已启用（LOCAL_OCR={'on' if LOCAL_OCR_ENABLE else 'off'}）"
-            )
-            await send_text(from_user, info)
+        # /ping
+        if content.strip().lower().startswith("/ping"):
+            info = [
+                f"当前活跃模型：{PRIMARY_MODEL}",
+                f"候选列表：{', '.join([PRIMARY_MODEL] + FALLBACK_MODELS)}",
+                f"组织ID：{OPENAI_ORG_ID or '(未设)'}",
+                f"记忆：{MEMORY_BACKEND}",
+                f"联网搜索：{'on' if WEB_SEARCH_ENABLE else 'off'} / {WEB_PROVIDER}",
+            ]
+            await send_text(from_user, "\n".join(info))
             return PlainTextResponse("success")
 
-        if content.startswith("/web "):
-            q = content[5:].strip()
-            result = await serp_search(q)
-            await send_text(from_user, result)
-            return PlainTextResponse("success")
-
-        # 普通对话（带记忆）
-        history = memory.load(from_user)
-        history.append({"role": "user", "content": content})
-        reply = await chat_with_models(history, max_out=512)
-        history.append({"role": "assistant", "content": reply})
-        memory.save(from_user, history)
-        await send_text(from_user, reply)
-        return PlainTextResponse("success")
-
-    # ---------- 图片 ----------
-    if msg_type == "image":
-        media_id = msg.get("MediaId")
-        await send_text(from_user, "已收到图片，正在识别…")
-        try:
-            file_bytes, ct = await download_wecom_media(media_id)
-            ocr_txt = await ocr_image(file_bytes)
-            if not ocr_txt:
-                await send_text(from_user, "（未识别到文字，或图片质量较低）")
+        # 联网搜索触发
+        should_web, web_q = _want_web_route(content)
+        if should_web:
+            if not WEB_SEARCH_ENABLE:
+                await send_text(from_user, "（联网搜索未启用：请把 WEB_SEARCH_ENABLE=true 并配置 SERPAPI_KEY）")
                 return PlainTextResponse("success")
-            summary = await summarize_long_text(ocr_txt, "你是图像文字识别与摘要助手。")
-            await send_text(from_user, f"【图片要点摘要】\n{summary}")
-        except Exception as e:
-            log.warning(f"image handle fail: {e}")
-            await send_text(from_user, "（图片解析失败）")
-        return PlainTextResponse("success")
+            try:
+                items = await _web_search_serpapi(web_q, k=5)
+                reply_text = _render_search(items, "serpapi")
+            except Exception as e:
+                logger.exception("web search failed")
+                reply_text = f"（联网搜索出错：{e}）"
+            await send_text(from_user, reply_text)
+            return PlainTextResponse("success")
 
-    # ---------- 文件（PDF / 图片等） ----------
-    if msg_type == "file":
-        fname = (msg.get("FileName") or "").strip().lower()
-        media_id = msg.get("MediaId")
-        await send_text(from_user, f"已收到文件：{fname}，正在处理…")
+        # ---- 普通对话：加载记忆 + 多模型回退 ----
         try:
-            file_bytes, ct = await download_wecom_media(media_id)
-            summary = ""
-            if fname.endswith(".pdf") or "pdf" in ct:
-                text = extract_text_from_pdf(file_bytes)
-                summary = await summarize_long_text(text, "你是专业文档助理。")
-            elif any(fname.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")) or ("image/" in ct):
-                ocr_txt = await ocr_image(file_bytes)
-                summary = await summarize_long_text(ocr_txt, "你是图像文字识别与摘要助手。")
-            else:
-                summary = "（暂不支持该格式，仅支持 PDF / PNG / JPG / WEBP）"
+            history = []
+            try:
+                history = await memory.load(from_user)
+            except Exception as e:
+                logger.warning("load memory failed: %s", e)
 
-            await send_text(from_user, f"【文件摘要】\n{summary}")
+            messages = [{"role": "system", "content": "你是企业微信里的智能助手，回答要简洁、直给。"}]
+            messages.extend(history[-8:])
+            messages.append({"role": "user", "content": content})
+
+            models_try = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m]
+            reply_text, used_model = await ask_models(messages, models_try)
+
+            # 发送
+            await send_text(from_user, reply_text)
+
+            # 写记忆（不因 Redis 故障阻塞）
+            try:
+                await memory.append(from_user, "user", content)
+                await memory.append(from_user, "assistant", reply_text)
+            except Exception as e:
+                logger.warning("append memory failed: %s", e)
+
+            return PlainTextResponse("success")
         except Exception as e:
-            log.warning(f"file handle fail: {e}")
-            await send_text(from_user, "（文件解析失败）")
-        return PlainTextResponse("success")
+            logger.exception("biz error: %s", e)
+            await send_text(from_user, "（服务端异常，可稍后再试或 /ping 自检）")
+            return PlainTextResponse("success")
 
-    # 其它类型
-    await send_text(from_user, f"（暂未支持的消息类型：{msg_type}）")
+    # ---- 其它类型（图片/文件等，后续扩展 PDF/图片解析）----
+    await send_text(from_user, "已收到消息（当前仅支持文本提问；文件/PDF/图片解析已接入变量与占位，稍后完善）。")
     return PlainTextResponse("success")
