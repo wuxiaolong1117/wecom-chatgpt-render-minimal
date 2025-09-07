@@ -49,7 +49,14 @@ app = FastAPI(title="WeCom + ChatGPT (files & images supported)")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # 视觉模型也支持，如 gpt-4o-mini/gpt-5
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-oai = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+OPENAI_ORG_ID   = os.getenv("OPENAI_ORG_ID", "")   # ← 新增
+
+# 新写法：显式带上 organization
+oai = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
+    organization=OPENAI_ORG_ID or None,
+)
 
 # WeCom 配置
 CORP_ID = os.getenv("WEWORK_CORP_ID", "")
