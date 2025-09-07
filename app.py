@@ -30,7 +30,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")          # 主模型（默认 gpt-5）
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini") # 回退模型
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini") # 回退模型（视觉/联网也优先用 4o-mini）
 MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "1024"))
 
 # 企业微信
@@ -46,7 +46,6 @@ MEMORY_WINDOW = int(os.getenv("MEMORY_WINDOW", "8"))
 
 # 联网搜索
 WEB_SEARCH_DEFAULT = os.getenv("WEB_SEARCH_DEFAULT", "off").lower() in ("1", "true", "yes", "on")
-# 只做“工具是否可用”的判定，不在此实现具体爬取流程（让模型自行整合）
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
@@ -148,20 +147,18 @@ async def get_wecom_token() -> str:
 
 # ====== WeCom 发送文本（分片 & 兜底）======
 async def send_text(userid: str, text: str):
-    # WeCom 不允许空内容
     if not text or not text.strip():
         text = "（生成内容为空，建议换个问法或稍后再试）"
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
 
-    max_len = 1800  # 安全阈值
+    max_len = 1800
     chunks = []
     s = text
     while s:
         chunks.append(s[:max_len])
         s = s[max_len:]
 
-    sent = 0
     for part in chunks:
         payload = {
             "touser": userid,
@@ -176,11 +173,9 @@ async def send_text(userid: str, text: str):
         except Exception:
             ret = {"errcode": -1, "errmsg": "invalid json"}
         logger.warning(f"WeCom send result -> to={userid} payload_len={len(part)} resp={ret}")
-        # 44004 空内容容错（极短碎片或全是不可见字符）
         if ret.get("errcode") == 44004:
             payload["text"]["content"] = "（生成内容为空，建议换个问法或稍后再试）"
             r2 = await client.post(url, json=payload)
-            logger.warning(f"WeCom send first attempt failed: {ret}, retrying...")
             try:
                 ret2 = r2.json()
             except Exception:
@@ -190,14 +185,9 @@ async def send_text(userid: str, text: str):
                 raise RuntimeError(f"WeCom send err: {ret2}")
         elif ret.get("errcode") != 0:
             raise RuntimeError(f"WeCom send err: {ret}")
-        sent += 1
-    return sent
 
 # ====== OpenAI 结果取值与兜底（补丁②）======
 def _pick_text(choices: List[Dict[str, Any]]) -> str:
-    """
-    统一提取 message.content；若只有 tool_calls 则提示“已调用联网检索…”；仍为空则返回空串。
-    """
     if not choices:
         return ""
     for ch in choices:
@@ -205,13 +195,193 @@ def _pick_text(choices: List[Dict[str, Any]]) -> str:
         txt = (msg.get("content") or "").strip()
         if txt:
             return txt
-    # 如果只有 tool_calls，无正文
     for ch in choices:
         msg = ch.get("message") or {}
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
             return "（已调用联网检索工具，正在整合结果…如无输出请稍后重试或换种问法）"
     return ""
+
+# ====== OpenAI 封装：文本聊天（含 gpt-5 兼容、按需 tools、回退）======
+async def ask_openai_text(messages: List[Dict[str, Any]],
+                          use_tools: bool = False,
+                          tools: Optional[List[Dict[str,Any]]] = None,
+                          prefer_model: Optional[str] = None) -> str:
+    model = prefer_model or OPENAI_MODEL
+    kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+    if MAX_COMPLETION_TOKENS:
+        kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+    if use_tools and tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    try:
+        comp = oai.chat.completions.create(**kwargs)
+        text = _pick_text(comp.choices)
+    except Exception as e:
+        logger.error(f"OpenAI call failed(main): {e}")
+        text = ""
+
+    if not text.strip():
+        fb_kwargs = {"model": FALLBACK_MODEL, "messages": messages}
+        if MAX_COMPLETION_TOKENS:
+            fb_kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+        if use_tools and tools:
+            fb_kwargs["tools"] = tools
+            fb_kwargs["tool_choice"] = "auto"
+        try:
+            comp2 = oai.chat.completions.create(**fb_kwargs)
+            text = _pick_text(comp2.choices)
+        except Exception as e:
+            logger.error(f"OpenAI call failed(fallback): {e}")
+            text = ""
+    return text
+
+# ====== 视觉 OCR（gpt-4o-mini）======
+async def ocr_images_to_text(image_b64_list: List[str]) -> str:
+    content = [{
+        "type": "text",
+        "text": "请把图片中的可读文字完整提取为纯文本；如有结构（标题、列表、表格）请用简单标记保留。"
+    }]
+    for b64 in image_b64_list:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"}
+        })
+    kwargs = {
+        "model": FALLBACK_MODEL,  # 视觉默认用 gpt-4o-mini
+        "messages": [{"role": "user", "content": content}],
+    }
+    if MAX_COMPLETION_TOKENS:
+        kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+    try:
+        comp = oai.chat.completions.create(**kwargs)
+        return _pick_text(comp.choices)
+    except Exception as e:
+        logger.error(f"vision ocr error: {e}")
+        return ""
+
+# ====== 文本分块与两阶段摘要 ======
+def split_text(s: str, max_chars: int = 6000) -> List[str]:
+    s = s.replace("\x00", "")
+    return [s[i:i+max_chars] for i in range(0, len(s), max_chars)]
+
+async def summarize_long_text(full_text: str, title: str = "") -> str:
+    if not full_text.strip():
+        return ""
+    chunks = split_text(full_text, 6000)
+    partial_summaries = []
+    for idx, ck in enumerate(chunks, 1):
+        msgs = [
+            {"role":"system","content":"你是资深中文编辑，提炼关键要点，直给信息；保留关键数字与专有名词。"},
+            {"role":"user","content":f"以下为第 {idx}/{len(chunks)} 段全文内容，请用要点列表概括：\n\n{ck}"}
+        ]
+        part = await ask_openai_text(msgs, use_tools=False)
+        partial_summaries.append(f"【第{idx}段摘要】\n{part}")
+
+    merge_text = "\n\n".join(partial_summaries)
+    final_msgs = [
+        {"role":"system","content":"你是资深中文分析师。"},
+        {"role":"user","content":f"这是一份长文的分段摘要，请合并为一份完整中文总结：\n"
+                                 f"1) 先给『一句话结论』；\n"
+                                 f"2) 再给『关键要点清单』；\n"
+                                 f"3) 如有建议或风险，请列出。\n\n{merge_text}"}
+    ]
+    final = await ask_openai_text(final_msgs, use_tools=False)
+    if title:
+        final = f"《{title}》全文解析\n\n{final}"
+    return final
+
+# ====== 下载企业微信媒体 ======
+async def download_wecom_media(media_id: str) -> bytes:
+    token = await get_wecom_token()
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
+    r = await client.get(url)
+    r.raise_for_status()
+    return r.content
+
+# ====== PDF 解析：文本优先 + 视觉 OCR 兜底 ======
+def extract_pdf_text_by_pypdf(pdf_bytes: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        texts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                texts.append(t)
+        return "\n".join(texts).strip()
+    except Exception as e:
+        logger.warning(f"pypdf extract failed: {e}")
+        return ""
+
+def render_pdf_pages_to_png_b64(pdf_bytes: bytes, max_pages: int = 10, dpi: int = 180) -> List[str]:
+    """用 PyMuPDF 将前 max_pages 页渲染为 PNG，返回 base64 列表。"""
+    b64_list: List[str] = []
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = min(max_pages, doc.page_count)
+        for i in range(pages):
+            pix = doc.load_page(i).get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
+            b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+            b64_list.append(b64)
+    except Exception as e:
+        logger.warning(f"render pdf to png failed: {e}")
+    return b64_list
+
+async def parse_pdf_fulltext(pdf_bytes: bytes) -> str:
+    # 1) 文本抽取
+    text = extract_pdf_text_by_pypdf(pdf_bytes)
+    if len(text) >= 1000:  # 基本可用
+        return text
+
+    # 2) 兜底：视觉 OCR（最多 10 页）
+    imgs_b64 = render_pdf_pages_to_png_b64(pdf_bytes, max_pages=10, dpi=180)
+    if not imgs_b64:
+        return text  # 空或极短
+    ocr_text = await ocr_images_to_text(imgs_b64)
+    # 合并文本/去重
+    merged = (text + "\n" + ocr_text).strip() if text else ocr_text
+    return merged
+
+# ====== 图片 OCR 工作流 ======
+async def process_image_message(user: str, media_id: str):
+    try:
+        await send_text(user, "已收到图片，开始识别文字与要点…")
+        img_bytes = await download_wecom_media(media_id)
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        raw_text = await ocr_images_to_text([b64])
+        if not raw_text.strip():
+            await send_text(user, "抱歉，未能从图片中识别到可读文字。")
+            return
+        summary = await summarize_long_text(raw_text, title="图片文字")
+        if not summary.strip():
+            summary = raw_text[:3500]
+        await send_text(user, summary)
+    except Exception as e:
+        logger.exception(e)
+        await send_text(user, "处理图片时出现异常，请稍后重试。")
+
+# ====== PDF 全文解析工作流 ======
+async def process_pdf_message(user: str, media_id: str, filename: str):
+    try:
+        await send_text(user, f"已收到 PDF《{filename}》，开始解析全文（完成后会推送结果）…")
+        pdf_bytes = await download_wecom_media(media_id)
+        full_text = await parse_pdf_fulltext(pdf_bytes)
+        if not full_text.strip():
+            await send_text(user, "未能从 PDF 中提取到可读内容，可能为扫描件或受保护文件。")
+            return
+        summary = await summarize_long_text(full_text, title=filename)
+        if not summary.strip():
+            summary = (full_text[:3500] + "\n\n（已截断，仅展示前 3500 字）")
+        await send_text(user, summary)
+    except Exception as e:
+        logger.exception(e)
+        await send_text(user, "解析 PDF 时出现异常，请稍后重试。")
 
 # ====== FastAPI ======
 app = FastAPI()
@@ -237,12 +407,11 @@ async def root():
 # ====== 企业微信回调 ======
 @app.api_route("/wecom/callback", methods=["GET", "POST"])
 async def wecom_callback(request: Request):
-    # --- 验证 GET （包括安全模式 echo）---
+    # --- GET 校验/echo ---
     if request.method == "GET":
         args = request.query_params
         echostr = args.get("echostr")
         if echostr:
-            # 安全模式校验
             if "msg_signature" in args and crypto:
                 msg_signature = args.get("msg_signature", "")
                 timestamp = args.get("timestamp", "")
@@ -287,7 +456,7 @@ async def wecom_callback(request: Request):
     msg_type = (data.get("MsgType", "") or "").lower()
     content = (data.get("Content", "") or "").strip()
 
-    # --- 命令 ---
+    # 命令
     if content.startswith("/ping"):
         await send_text(from_user, "pong")
         return PlainTextResponse("success")
@@ -305,7 +474,6 @@ async def wecom_callback(request: Request):
         await send_text(from_user, txt)
         return PlainTextResponse("success")
 
-    # /web on /web off /web xxx
     global web_enabled_flag
     if content.startswith("/web"):
         seg = content.split(None, 1)
@@ -317,21 +485,18 @@ async def wecom_callback(request: Request):
             web_enabled_flag = arg in ("on","true","开启")
             await send_text(from_user, f"Web access 已{'开启' if web_enabled_flag else '关闭'}")
             return PlainTextResponse("success")
-        # 临时联网：直接把问题改写为用户问法
         content = arg
 
-    # --- 普通文本 ---
+    # 文本
     if msg_type == "text":
-        # 取记忆
         history = MEM.load(from_user)
         messages = [{"role":"system","content":"你是企业微信助手，回答简洁、可读性强；当被要求联网搜索时可引用结果给出简要结论和参考链接。"}]
         for r, c in history:
             messages.append({"role":r, "content":c})
         messages.append({"role":"user", "content":content})
 
-        # ===== 决定是否启用工具（补丁①：仅在有提供商 + 开关开启时传）=====
+        # 仅在有提供商 + 开关开启时传 tools（补丁①）
         use_web_tool = (web_enabled_flag and has_search_provider())
-
         tools: List[Dict[str, Any]] = []
         if use_web_tool:
             tools = [{
@@ -350,56 +515,30 @@ async def wecom_callback(request: Request):
                 }
             }]
 
-        # ===== 主模型 =====
-        kwargs: Dict[str, Any] = {
-            "model": OPENAI_MODEL,
-            "messages": messages,
-        }
-        # gpt-5 系列：不传 temperature，不传 max_tokens，用 max_completion_tokens
-        if MAX_COMPLETION_TOKENS:
-            kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
-        if tools:                          # 只有在存在工具时才传 tools / tool_choice（补丁①）
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        try:
-            completion = oai.chat.completions.create(**kwargs)
-            reply_text = _pick_text(completion.choices)  # （补丁②）
-        except Exception as e:
-            logger.error(f"OpenAI call failed(main): {e}")
-            reply_text = ""
-
-        # ===== 回退模型 =====
-        if not reply_text.strip():
-            logger.warning("primary model failed: empty content from primary model")
-            fb_kwargs: Dict[str, Any] = {
-                "model": FALLBACK_MODEL,
-                "messages": messages,
-            }
-            # 4o-mini 可设 temperature，但保持默认即可；同样遵守“有 tools 才传”
-            if MAX_COMPLETION_TOKENS:
-                fb_kwargs["max_completion_tokens"] = MAX_COMPLETION_TOKENS
-            if tools:
-                fb_kwargs["tools"] = tools
-                fb_kwargs["tool_choice"] = "auto"
-            try:
-                completion2 = oai.chat.completions.create(**fb_kwargs)
-                reply_text = _pick_text(completion2.choices)
-            except Exception as e:
-                logger.error(f"OpenAI call failed(fallback): {e}")
-                reply_text = ""
-
-        # 存记忆
+        reply_text = await ask_openai_text(messages, use_tools=use_web_tool, tools=tools)
         MEM.append(from_user, "user", content)
         if reply_text.strip():
             MEM.append(from_user, "assistant", reply_text)
-
-        # 发送
         await send_text(from_user, reply_text)
         return PlainTextResponse("success")
 
-    # 非文本消息
-    await send_text(from_user, "暂时只支持文本消息（PDF/图片等请稍后使用“文件消息处理”版本）")
+    # 图片
+    if msg_type == "image":
+        media_id = data.get("MediaId", "")
+        asyncio.create_task(process_image_message(from_user, media_id))
+        return PlainTextResponse("success")
+
+    # 文件（PDF）
+    if msg_type == "file":
+        filename = (data.get("FileName", "") or "")
+        media_id = data.get("MediaId", "")
+        if filename.lower().endswith(".pdf"):
+            asyncio.create_task(process_pdf_message(from_user, media_id, filename))
+            return PlainTextResponse("success")
+        await send_text(from_user, f"目前仅支持 PDF 文件解析（收到：{filename}）。")
+        return PlainTextResponse("success")
+
+    await send_text(from_user, "暂时只支持文本 / 图片 / PDF。")
     return PlainTextResponse("success")
 
 # ====== 关机清理 ======

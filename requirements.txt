@@ -23,3 +23,6 @@ python-multipart>=0.0.9,<0.0.10
 
 # 性能更好的 JSON 序列化（可选，FastAPI 会自动使用）
 orjson>=3.10,<4.0
+
+pymupdf==1.24.9
+pypdf==4.2.0
