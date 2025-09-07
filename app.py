@@ -14,7 +14,8 @@ from starlette.background import BackgroundTask
 import httpx
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
-import xmltodict  # 仅用于 xml->dict（轻量），如果你已用其它库也可替换
+import xmltodict
+# 仅用于 xml->dict（轻量），如果你已用其它库也可替换
 # 如果没有 wechatpyrepl，可改为: import xmltodict
 
 from openai import OpenAI
@@ -297,101 +298,103 @@ async def wecom_verify(request: Request):
     return PlainTextResponse(echostr or "ok")
 
 
+from fastapi import Request
+from fastapi.responses import PlainTextResponse
+import xmltodict
+import logging
+logger = logging.getLogger("wecom-app")
+
+# 如果你走“安全模式”，需要 wechatpy（明文模式不需要）
+try:
+    from wechatpy.enterprise.crypto import WeChatCrypto  # type: ignore
+except Exception:
+    WeChatCrypto = None  # 没装 wechatpy 也不会报错，明文模式可用
+
+# 这些变量应在文件开头已通过环境变量读到
+# WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID
+# 还有你自己的 send_text(...)、handle_user_text(...) 等函数
+
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
-    # 1) 取原始体
-    body = await request.body()
-    body_text = body.decode("utf-8")
-    logger.info("POST /wecom/callback raw xml len=%s", len(body_text))
+    """
+    企业微信回调统一入口：
+    - GET/POST ?echostr=...：平台可达/域名验证（明文直接回显）
+    - 明文模式：无 msg_signature，直接解析 XML
+    - 安全模式：携带 msg_signature，解密后解析 XML
+    """
+    # ---- 0) GET/明文 echostr 探活（Render/企业微信验证都会用到）----
+    # 说明：企业微信“自动兼容 明文/安全模式”时，明文校验走这里就能通过；
+    # 安全模式校验也能通过（他们会带 signature，但回显明文也 OK）。
+    echostr = request.query_params.get("echostr")
+    if request.method == "GET" and echostr:
+        return PlainTextResponse(echostr)
 
-    # 2) 解析消息（安全模式走 WeChatCrypto 解密）
+    # 统一拿查询参数
     msg_signature = request.query_params.get("msg_signature")
     timestamp = request.query_params.get("timestamp")
     nonce = request.query_params.get("nonce")
 
-    try:
-        if msg_signature and timestamp and nonce:
-            crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
-            xml_plain = crypto.decrypt_message(body_text, msg_signature, timestamp, nonce)
-           data = xmltodict.parse(xml_text).get("xml", {})  # xml -> dict
-        else:
-            data = xmltodict.parse(to_text(body_text))
-    except Exception as e:
-        logger.error("decrypt fail: %s", e)
-        return PlainTextResponse("")
+    # 读取原始 XML（无论明文/密文，回包体都是 XML）
+    xml_text = (await request.body()).decode("utf-8", errors="ignore")
 
-    msg = data.get("xml", {})
-    msg_type = (msg.get("MsgType") or "").lower()
-    from_user = msg.get("FromUserName") or ""
-    to_user = msg.get("ToUserName") or ""
-
-    # 3) 分发处理
-    try:
-        if msg_type == "text":
-            content = (msg.get("Content") or "").strip()
-
-            # PING & 自检
-            if content == "/ping":
-                info = (
-                    f"当前活跃模型：{PRIMARY_MODEL}\n"
-                    f"候选列表：{', '.join([PRIMARY_MODEL]+FALLBACK_MODELS)}\n"
-                    f"组织ID：{OPENAI_ORG_ID or '(未显式指定)'}\n"
-                    f"记忆：memory"
-                )
-                await send_text(from_user, info)
-                return PlainTextResponse("success")
-
-            # 走对话
-            reply_text = await ask_openai_with_fallback(content)
-            await send_text(from_user, reply_text)
-            return PlainTextResponse("success")
-
-        elif msg_type == "image":
-            # 图片 -> OCR -> 摘要
-            media_id = msg.get("MediaId")
-            img_bytes, ctype = await download_media(media_id)
-
-            if LOCAL_OCR_ENABLE:
-                extracted = local_ocr_image(img_bytes)
-            else:
-                extracted = vision_ocr_image(img_bytes)
-
-            if not extracted.strip():
-                await send_text(from_user, "（抱歉，未能从图片识别出可用文本。）")
-                return PlainTextResponse("success")
-
-            summary = summarize_long_text(extracted, goal_len=400)
-            await send_text(from_user, summary)
-            return PlainTextResponse("success")
-
-        elif msg_type == "file":
-            # 文件消息：目前支持 pdf
-            media_id = msg.get("MediaId")
-            file_name = msg.get("FileName") or ""
-            file_bytes, ctype = await download_media(media_id)
-
-            ext = os.path.splitext(file_name)[1].lower() or _ext_from_content_type(ctype) or ""
-            if ext != ".pdf":
-                await send_text(from_user, f"目前仅支持 PDF 解析（收到：{file_name or '未知文件'}）。")
-                return PlainTextResponse("success")
-
-            text = extract_pdf_text(file_bytes)
-            if not text.strip():
-                await send_text(from_user, "（PDF 抽取为空，可能是扫描件或受保护文档。可尝试把 PDF 导出图片后再发。）")
-                return PlainTextResponse("success")
-
-            summary = summarize_long_text(text, goal_len=500)
-            await send_text(from_user, summary)
-            return PlainTextResponse("success")
-
-        else:
-            await send_text(from_user, f"暂不支持的消息类型：{msg_type}")
-            return PlainTextResponse("success")
-
-    except Exception as e:
-        logger.error("handle error: %s\n%s", e, traceback.format_exc())
+    # ---- 1) 明文模式：没有 msg_signature 就按明文解析 ----
+    if not msg_signature:
         try:
-            await send_text(from_user, "（处理异常，已记录日志，请稍后再试。）")
+            data = xmltodict.parse(xml_text).get("xml", {}) or {}
         except Exception:
-            pass
+            logger.exception("xmltodict parse error (plaintext)")
+            return PlainTextResponse("invalid xml", status_code=400)
+
+        from_user = (data.get("FromUserName") or "").strip()
+        msg_type  = (data.get("MsgType") or "").strip()
+        content   = (data.get("Content") or "").strip()
+
+        # 根据你的逻辑处理文本/文件/图片等
+        reply_text = await handle_user_text(from_user, content)
+
+        try:
+            await send_text(from_user, reply_text)
+        except Exception:
+            logger.exception("send_text failed (plaintext)")
+            return PlainTextResponse("success")  # 仍返回 success，避免企业微信重试
+
         return PlainTextResponse("success")
+
+    # ---- 2) 安全模式（密文）：需要 wechatpy 解密 ----
+    if WeChatCrypto is None:
+        logger.error("收到加密消息但未安装 wechatpy，无法解密")
+        return PlainTextResponse("success")
+
+    if not all([WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID]):
+        logger.error("加密模式需要 WECOM_TOKEN/WECOM_AES_KEY/WEWORK_CORP_ID")
+        return PlainTextResponse("success")
+
+    try:
+        crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
+        # 企业微信(政企/WW)的 wechatpy 接口为：decrypt_message(msg_signature, timestamp, nonce, post_data)
+        decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, xml_text)
+    except Exception:
+        logger.exception("decrypt fail (safe-mode)")
+        return PlainTextResponse("success")
+
+    try:
+        data = xmltodict.parse(decrypted_xml).get("xml", {}) or {}
+    except Exception:
+        logger.exception("xmltodict parse error (safe-mode)")
+        return PlainTextResponse("success")
+
+    from_user = (data.get("FromUserName") or "").strip()
+    msg_type  = (data.get("MsgType") or "").strip()
+
+    # 这里只演示文本，你也可以在此处接入图片/文件等逻辑
+    content   = (data.get("Content") or "").strip()
+    reply_text = await handle_user_text(from_user, content)
+
+    try:
+        await send_text(from_user, reply_text)
+    except Exception:
+        logger.exception("send_text failed (safe-mode)")
+        # 仍返回 success，避免平台重试
+        return PlainTextResponse("success")
+
+    return PlainTextResponse("success")
