@@ -1,19 +1,25 @@
-import os
-import io
-import base64
-import json
-import time
-import logging
-import traceback
-from typing import List, Optional, Tuple
+# app.py  —— WeCom (企业微信) ↔ OpenAI 网关（明/密文兼容，健壮解密）
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
-from starlette.background import BackgroundTask
+import os
+import re
+import json
+import gzip
+import zlib
+import time
+import asyncio
+import logging
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
+import xmltodict
+from fastapi import FastAPI, Request
+from starlette.responses import PlainTextResponse, JSONResponse
 
-# --- optional wechatpy: 仅安全模式解密会用到；明文模式可以没有 ---
+# ----------------------- 日志 -----------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("wecom-app")
+
+# ----------------------- 可选导入 wechatpy（仅安全模式解密需要） -----------------------
 try:
     from wechatpy.enterprise.crypto import WeChatCrypto  # type: ignore
     from wechatpy.utils import to_text as _wechat_to_text  # type: ignore
@@ -22,11 +28,7 @@ except Exception:
     _wechat_to_text = None
 
 def to_text(val):
-    """
-    wechatpy.utils.to_text 的轻量兜底实现：
-    - wechatpy 存在：直接用官方实现
-    - wechatpy 不存在：尽量把 bytes/None 转成 str
-    """
+    """wechatpy.utils.to_text 的轻量兜底：未安装 wechatpy 时也能用。"""
     if _wechat_to_text is not None:
         return _wechat_to_text(val)
     if val is None:
@@ -38,308 +40,169 @@ def to_text(val):
             return val.decode("latin1", "ignore")
     return str(val)
 
-import xmltodict
-# 仅用于 xml->dict（轻量），如果你已用其它库也可替换
-# 如果没有 wechatpyrepl，可改为: import xmltodict
+# ----------------------- 环境变量 -----------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "") or None
 
-from openai import OpenAI
+# 模型主备（主：OPENAI_MODEL；备：OPENAI_FALLBACK_MODELS 逗号分隔）
+PRIMARY_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+FALLBACK_MODELS = [m.strip() for m in os.getenv("OPENAI_FALLBACK_MODELS", "gpt-4o-mini").split(",") if m.strip()]
 
-from pypdf import PdfReader
+# 企业微信
+WEWORK_CORP_ID = os.getenv("WEWORK_CORP_ID", "")
+WEWORK_SECRET = os.getenv("WEWORK_SECRET", "")
+WEWORK_AGENT_ID = os.getenv("WEWORK_AGENT_ID", "")
+WECOM_TOKEN = os.getenv("WECOM_TOKEN", "")
+WECOM_AES_KEY = os.getenv("WECOM_AES_KEY", "")
 
-# ====== 环境变量 ======
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL  = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+# 其它
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
 
-# 候选模型（按优先级）
-PRIMARY_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5")
-FALLBACK_MODELS  = [m.strip() for m in os.getenv("OPENAI_FALLBACK_MODELS", "gpt-5-mini,gpt-4o-mini").split(",") if m.strip()]
-SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")  # 用于 PDF/图片摘要
-VISION_MODEL     = os.getenv("VISION_MODEL", "gpt-4o-mini")     # 图片 OCR 默认走视觉
+# ----------------------- OpenAI 客户端（HTTP 调用） -----------------------
+# 统一用 httpx 直调 Chat Completions（兼容 gpt-5 的参数差异）
+OPENAI_CHAT_COMPLETIONS_URL = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
+OAI_HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "Content-Type": "application/json",
+}
+if OPENAI_ORG_ID:
+    OAI_HEADERS["OpenAI-Organization"] = OPENAI_ORG_ID
 
-OPENAI_ORG_ID    = os.getenv("OPENAI_ORG_ID", "")               # 显式组织（你已经验证通过）
+async def call_openai_chat(model: str, messages: list, max_tokens: int = 800, temperature: Optional[float] = None) -> str:
+    """
+    兼容 gpt-5：不传 temperature（固定为默认1），并使用 max_completion_tokens。
+    其它模型：使用 max_tokens 与可选 temperature。
+    """
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    # gpt-5 / gpt-5-mini 参数差异
+    if model.startswith("gpt-5"):
+        payload["max_completion_tokens"] = max_tokens
+        # 不传 temperature（gpt-5 仅支持默认 1）
+    else:
+        payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
 
-# WeCom
-WECOM_TOKEN      = os.getenv("WECOM_TOKEN", "")
-WECOM_AES_KEY    = os.getenv("WECOM_AES_KEY", "")
-WEWORK_CORP_ID   = os.getenv("WEWORK_CORP_ID", "")
-WEWORK_SECRET    = os.getenv("WEWORK_SECRET", "")
-WEWORK_AGENT_ID  = os.getenv("WEWORK_AGENT_ID", "")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.post(OPENAI_CHAT_COMPLETIONS_URL, headers=OAI_HEADERS, json=payload)
+        if r.status_code != 200:
+            # 提供清晰错误日志
+            try:
+                detail = r.json()
+            except Exception:
+                detail = {"raw": r.text}
+            logger.error("OpenAI call failed: %s - %s", r.status_code, detail)
+            raise RuntimeError(f"openai_error_{r.status_code}")
+        data = r.json()
+        content = (((data or {}).get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return content.strip()
 
-# 解析策略
-LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() in ("1", "true", "yes")
-MAX_INPUT_CHARS  = int(os.getenv("MAX_INPUT_CHARS", "120000"))      # 单次最大抽取长度
-CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "8000"))             # 分块大小
-CHUNK_SUMMARY    = int(os.getenv("CHUNK_SUMMARY", "1200"))          # 每块汇总目标字数（提示参考）
+async def ask_llm(user_text: str) -> str:
+    """主备模型自动回退，且避免空响应。"""
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_text.strip()},
+    ]
+    # 主模型
+    try:
+        ans = await call_openai_chat(PRIMARY_MODEL, messages, max_tokens=800)
+        if not ans:
+            raise RuntimeError("empty content from primary model")
+        return ans
+    except Exception as e:
+        logger.warning("primary model %s failed: %s", PRIMARY_MODEL, e)
 
-# 日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wecom-app")
+    # 备选模型（依次尝试）
+    for m in FALLBACK_MODELS:
+        try:
+            ans = await call_openai_chat(m, messages, max_tokens=800)
+            if ans:
+                return ans
+        except Exception as e:
+            logger.warning("fallback model %s failed: %s", m, e)
 
-# OpenAI 客户端（显式组织）
-oai = OpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
-    organization=OPENAI_ORG_ID or None,
-)
+    return "（抱歉，我现在有点忙，稍后再试试吧。）"
 
-app = FastAPI()
+# ----------------------- 企业微信：AccessToken 缓存 -----------------------
+_token_cache: Dict[str, Any] = {"token": None, "expire_at": 0}
 
-
-# ====== 工具函数 ======
 async def get_wecom_token() -> str:
+    now = time.time()
+    if _token_cache["token"] and _token_cache["expire_at"] - now > 60:
+        return str(_token_cache["token"])
+
     url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WEWORK_CORP_ID}&corpsecret={WEWORK_SECRET}"
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.get(url)
         data = r.json()
-    if data.get("errcode") != 0:
-        raise RuntimeError(f"gettoken failed: {data}")
-    return data["access_token"]
+        if data.get("errcode") != 0:
+            raise RuntimeError(f"gettoken err: {data}")
+        token = data["access_token"]
+        # 官方通常7200s，这里略缩，提前过期
+        _token_cache["token"] = token
+        _token_cache["expire_at"] = now + int(data.get("expires_in", 7200)) - 120
+        return token
 
-
-async def send_text(to_user: str, text: str):
+async def send_text(to_user: str, content: str):
     """
-    发送文本给单人；自动避免 44004（空内容）：
-    - 为空时，发送一个最小兜底文本
+    企业微信文本消息发送。避免 errcode=44004（empty content）：
+    - 去除两端空白后为空时，用占位符替代。
+    - 首次失败 44004 再自动补位重试一次。
     """
-    payload_text = text.strip() or "（解析成功，但本段内容过短，请换个问题或重试）"
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-    payload = {
-        "touser": to_user,
-        "msgtype": "text",
-        "agentid": int(WEWORK_AGENT_ID),
-        "text": {"content": payload_text},
-        "safe": 0
-    }
-    async with httpx.AsyncClient(timeout=12) as client:
+
+    def _payload(txt: str) -> Dict[str, Any]:
+        return {
+            "touser": to_user,
+            "msgtype": "text",
+            "agentid": int(WEWORK_AGENT_ID),
+            "text": {"content": txt},
+            "safe": 0,
+            "enable_id_trans": 0,
+            "enable_duplicate_check": 0,
+        }
+
+    txt = content if content and content.strip() else "（空回复）"
+    payload = _payload(txt)
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.post(url, json=payload)
-        data = r.json()
-        logger.warning("WeCom send result -> to=%s payload_len=%s resp=%s", to_user, len(payload_text), data)
-        if data.get("errcode") != 0:
-            raise RuntimeError(f"WeCom send err: {data}")
+        ret = r.json()
+        logger.warning("WeCom send result -> to=%s payload_len=%d resp=%s", to_user, len(txt), ret)
+        if ret.get("errcode") == 0:
+            return
 
+        # 避免 empty content
+        if ret.get("errcode") == 44004:
+            logger.warning("WeCom send first attempt failed: %s, retrying...", ret)
+            txt2 = txt if txt.strip() else "。"  # 非空白字符
+            r2 = await client.post(url, json=_payload(txt2))
+            ret2 = r2.json()
+            logger.warning("WeCom retry result -> resp=%s", ret2)
+            if ret2.get("errcode") == 0:
+                return
 
-async def download_media(media_id: str) -> Tuple[bytes, Optional[str]]:
-    """下载临时素材，返回(字节, content_type)"""
-    token = await get_wecom_token()
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            raise RuntimeError(f"download media failed: {r.status_code}")
-        return r.content, r.headers.get("Content-Type")
+        raise RuntimeError(f"WeCom send err: {ret}")
 
-
-def _ext_from_content_type(ct: Optional[str]) -> Optional[str]:
-    if not ct:
-        return None
-    ct = ct.lower()
-    if "pdf" in ct: return ".pdf"
-    if "jpeg" in ct or "jpg" in ct: return ".jpg"
-    if "png" in ct: return ".png"
-    if "webp" in ct: return ".webp"
-    if "heic" in ct: return ".heic"
-    return None
-
-
-def _chunk_text(s: str, size: int) -> List[str]:
-    return [s[i:i+size] for i in range(0, len(s), size)]
-
-
-# ====== 文档解析 ======
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """使用 PyPDF 抽取全文"""
-    text_parts: List[str] = []
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    for page in reader.pages:
-        t = page.extract_text() or ""
-        text_parts.append(t)
-    text = "\n".join(text_parts).strip()
-    # 控长
-    if len(text) > MAX_INPUT_CHARS:
-        text = text[:MAX_INPUT_CHARS]
-    return text
-
-
-def local_ocr_image(img_bytes: bytes) -> str:
-    """本地 OCR（需要系统有 Tesseract；Render 常见镜像没有，默认不用）"""
-    try:
-        from PIL import Image
-        import pytesseract
-        img = Image.open(io.BytesIO(img_bytes))
-        txt = pytesseract.image_to_string(img, lang="chi_sim+eng")
-        return (txt or "").strip()
-    except Exception as e:
-        logger.warning("local OCR failed: %s", e)
-        return ""
-
-
-def vision_ocr_image(img_bytes: bytes) -> str:
-    """OpenAI 视觉 OCR。把图片转成 data URL 走 vision 模型"""
-    b64 = base64.b64encode(img_bytes).decode()
-    data_url = f"data:image/png;base64,{b64}"
-    try:
-        resp = oai.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an OCR engine. Extract all readable text from the image faithfully. Output plain text only."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Extract all text in this image. Keep reading order as much as possible."},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ]
-                }
-            ],
-            # 视觉模型通常不要求这些参数；这里不设 temperature 等，避免不被支持
-            max_completion_tokens=5000,
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        return txt
-    except Exception as e:
-        logger.error("vision OCR failed: %s\n%s", e, traceback.format_exc())
-        return ""
-
-
-def summarize_long_text(raw: str, goal_len: int = 400) -> str:
-    """
-    超长文本递归汇总：
-    1) >CHUNK_SIZE 分块 -> 每块生成要点
-    2) 把要点合并再总结
-    """
-    if not raw.strip():
-        return "（没有可总结的文本内容）"
-
-    # 单块直接总结
-    if len(raw) <= CHUNK_SIZE:
-        prompt = (
-            f"请根据以下原文做结构化中文摘要，面向商务读者，尽量包含关键数据/方法/结论。\n"
-            f"- 目标长度：约 {goal_len} 字\n"
-            f"- 输出格式：三要点 + 一句结论\n"
-            f"- 若原文非中文，请先翻译再总结\n\n"
-            f"【原文】\n{raw}"
-        )
-        try:
-            r = oai.chat.completions.create(
-                model=SUMMARIZER_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=goal_len * 2
-            )
-            return (r.choices[0].message.content or "").strip()
-        except Exception as e:
-            logger.error("summarize failed: %s", e)
-            return "（摘要失败，请稍后重试）"
-
-    # 多块：先分块要点 -> 汇总
-    chunks = _chunk_text(raw, CHUNK_SIZE)
-    points: List[str] = []
-    for idx, ch in enumerate(chunks, 1):
-        sub_prompt = (
-            f"以下是第 {idx}/{len(chunks)} 段文本，请提取3-5个要点（中文，保留关键数据/术语），每个要点一行：\n\n{ch}"
-        )
-        try:
-            r = oai.chat.completions.create(
-                model=SUMMARIZER_MODEL,
-                messages=[{"role": "user", "content": sub_prompt}],
-                max_completion_tokens=CHUNK_SUMMARY
-            )
-            pts = (r.choices[0].message.content or "").strip()
-            points.append(pts)
-        except Exception as e:
-            logger.warning("chunk summarize failed: %s", e)
-
-    all_pts = "\n".join(points)
-    final_prompt = (
-        "根据下列分块要点，整合为一份完整中文摘要：\n"
-        f"- 总体长度：约 {goal_len} 字\n"
-        "- 结构：三要点 + 一句结论\n"
-        "- 保留关键数据与方法\n\n"
-        f"【分块要点汇总】\n{all_pts}"
-    )
-    try:
-        r = oai.chat.completions.create(
-            model=SUMMARIZER_MODEL,
-            messages=[{"role": "user", "content": final_prompt}],
-            max_completion_tokens=goal_len * 2
-        )
-        return (r.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.error("final summarize failed: %s", e)
-        return all_pts[:goal_len] or "（摘要失败，请稍后重试）"
-
-
-# ====== OpenAI 调用（文本对话，带回退与空输出兜底）======
-async def ask_openai_with_fallback(user_text: str) -> str:
-    candidates = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m]
-    last_err = None
-
-    for m in candidates:
-        try:
-            # 注意：gpt-5 系列不接受 temperature/max_tokens 参数，用 max_completion_tokens
-            resp = oai.chat.completions.create(
-                model=m,
-                messages=[{"role": "user", "content": user_text}],
-                max_completion_tokens=1024,
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            if content:
-                return content
-            logger.warning("primary model %s failed: empty content from primary model", m)
-        except Exception as e:
-            last_err = e
-            logger.warning("model %s failed: %s", m, e)
-            continue
-
-    # 所有候选失败 => 兜底
-    logger.error("all models failed, last error: %s", last_err)
-    return "（模型临时没有返回内容，建议换个问法或稍后再试）"
-
-
-# ====== WeCom 回调 ======
-@app.get("/", response_class=JSONResponse)
-async def root():
-    return {
-        "status": "ok",
-        "mode": "safe",
-        "service": "WeCom + ChatGPT",
-        "model": f"{PRIMARY_MODEL}",
-        "candidates": [PRIMARY_MODEL] + FALLBACK_MODELS,
-        "memory": "memory",
-        "pdf_support": True,
-        "local_ocr": LOCAL_OCR_ENABLE,
-    }
-
-
-@app.get("/wecom/callback")
-async def wecom_verify(request: Request):
-    """
-    明文/安全模式兼容：GET 验签后直接把 echostr 原样返回
-    """
-    echostr = request.query_params.get("echostr", "")
-    return PlainTextResponse(echostr or "ok")
-
-
-from fastapi import Request
-# 顶部 import（如已存在可跳过）
-import re, json, gzip, zlib
-from starlette.responses import PlainTextResponse
-
+# ----------------------- 工具：日志预览 & 载荷修复 -----------------------
 def _head_preview(s: str) -> str:
     return re.sub(r"[\r\n\t ]+", " ", (s or "")[:120])
 
-def _ensure_xml_for_wechatpy(body_text: str) -> tuple[str, str]:
+def _ensure_xml_for_wechatpy(body_text: str) -> Tuple[str, str]:
     """
-    让任意形态的 body 变成 wechatpy.decrypt_message 所需 XML。
-    返回: (xml_string, how)；xml_string 为空说明失败。
+    把各种形态的 body 变成 wechatpy.decrypt_message 所需 XML。
+    返回: (xml_string, how)。为空表示失败。
     """
     t = (body_text or "").lstrip("\ufeff").strip()
     if not t:
         return "", "empty"
 
-    # 1) JSON -> 构造 xml
+    # JSON -> xml
     if t.startswith("{"):
         try:
             obj = json.loads(t)
@@ -351,19 +214,12 @@ def _ensure_xml_for_wechatpy(body_text: str) -> tuple[str, str]:
         except Exception as e:
             return "", f"json error: {e}"
 
-    # 2) 原本就是 XML
+    # 原本就是 XML
     if t.startswith("<"):
-        # 已包含 Encrypt 就直接交给 wechatpy
         if ("<Encrypt>" in t) or ("<Encrypt><![CDATA[" in t):
             return t, "xml"
-        # 没有 Encrypt，尝试从 XML 内抢救
-        m = re.search(r"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", t, re.S)
-        if m:
-            enc = m.group(1)
-            xml = f"<xml><ToUserName><![CDATA[]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
-            return xml, "xml-salvaged"
 
-    # 3) 杂形态：urlencoded / 代理前缀/文本包裹等，尽力提取 Encrypt
+    # 兜底：正则抢救 Encrypt
     m = (re.search(r'"Encrypt"\s*:\s*"([^"]+)"', t) or
          re.search(r"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", t, re.S) or
          re.search(r"encrypt=([A-Za-z0-9+/=]+)", t))
@@ -374,14 +230,45 @@ def _ensure_xml_for_wechatpy(body_text: str) -> tuple[str, str]:
 
     return "", "no-encrypt-field"
 
+# ----------------------- FastAPI -----------------------
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return JSONResponse({
+        "status": "ok",
+        "mode": "safe" if (WECOM_AES_KEY or "").strip() else "plain",
+        "service": "WeCom + ChatGPT",
+        "model": PRIMARY_MODEL,
+        "candidates": FALLBACK_MODELS,
+        "pdf_support": False,
+        "local_ocr": False,
+    })
+
+# 探活（企业微信 & Render）
+@app.get("/wecom/callback")
+async def wecom_callback_get(request: Request):
+    echostr = request.query_params.get("echostr")
+    if echostr:
+        return PlainTextResponse(echostr)
+    return PlainTextResponse("ok")
+
+# 回调（消息）
 @app.post("/wecom/callback")
 async def wecom_callback(request: Request):
-    # 1) query
+    """
+    企业微信回调（消息）。兼容：
+    - 安全模式（加密）：msg_signature 存在时走 WeChatCrypto 解密
+    - 明文模式：直接 xmltodict 解析
+    - 只读一次 body；若 gzip/deflate 则自动解压
+    - 解析失败安全返回 "success" 防止企业微信重试
+    """
+    # -------- query --------
     msg_signature = request.query_params.get("msg_signature")
     timestamp     = request.query_params.get("timestamp")
     nonce         = request.query_params.get("nonce")
 
-    # 2) 读 body（只读一次） + 解压 + 去 BOM
+    # -------- body（只读一次）+ 解压 --------
     raw = await request.body()
     enc_hdr = (request.headers.get("Content-Encoding") or "").lower()
     try:
@@ -393,39 +280,58 @@ async def wecom_callback(request: Request):
         logger.warning("safe-mode: decompress fail enc=%s err=%s", enc_hdr, e)
     text = raw.decode("utf-8", "ignore").lstrip("\ufeff").strip()
 
-    # 是否安全模式：有签名 + AES_KEY
     is_safe_mode = bool(msg_signature and (WECOM_AES_KEY or "").strip())
+    data: Dict[str, Any] = {}
 
-    data = {}
     if is_safe_mode:
         if WeChatCrypto is None:
             logger.error("decrypt fail: wechatpy not installed")
             return PlainTextResponse("success")
 
-        # 将 body 统一整理成 wechatpy 需要的 XML
         xml_for_wechatpy, how = _ensure_xml_for_wechatpy(text)
         if not xml_for_wechatpy:
-            logger.error(
-                "safe-mode: cannot convert body to xml (%s); head=%r; ct=%s",
-                how, _head_preview(text), request.headers.get("Content-Type")
-            )
-            return PlainTextResponse("success")
+            # 再尝试直接从原始字节救一次（避免 decode 破坏结构）
+            m = re.search(br"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", raw, re.S) or \
+                re.search(br'"Encrypt"\s*:\s*"([^"]+)"', raw)
+            if m:
+                enc = (m.group(1).decode("utf-8", "ignore"))
+                xml_for_wechatpy = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+                how = "bytes-regex-salvaged"
+            else:
+                logger.error(
+                    "safe-mode: cannot convert body to xml (%s); head=%r; ct=%s",
+                    how, _head_preview(text), request.headers.get("Content-Type")
+                )
+                return PlainTextResponse("success")
+
+        # 预解析验证（有的网关会在前面插奇怪字节）
+        try:
+            _ = xmltodict.parse(xml_for_wechatpy)
+        except Exception as e:
+            logger.warning("safe-mode: pre-parse xml fail (%s), try rebuild from bytes", e)
+            m = re.search(br"<Encrypt><!\[CDATA\[(.*?)\]\]></Encrypt>", raw, re.S) or \
+                re.search(br'"Encrypt"\s*:\s*"([^"]+)"', raw)
+            if m:
+                enc = m.group(1).decode("utf-8", "ignore")
+                xml_for_wechatpy = f"<xml><ToUserName><![CDATA[{WEWORK_CORP_ID}]]></ToUserName><Encrypt><![CDATA[{enc}]]></Encrypt></xml>"
+                how += "+rebuild"
+            else:
+                logger.error("safe-mode: salvage-from-bytes failed. head_bytes=%r", raw[:100])
+                return PlainTextResponse("success")
 
         logger.info("safe-mode: using payload (%s); head=%r", how, _head_preview(xml_for_wechatpy))
 
-        # 解密
         try:
             crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
             decrypted_xml = crypto.decrypt_message(
-                msg_signature, timestamp, nonce, xml_for_wechatpy
+                msg_signature, str(timestamp), str(nonce), xml_for_wechatpy
             )
         except Exception:
             logger.exception("ERROR:wecom-app:decrypt fail (safe-mode)")
             return PlainTextResponse("success")
 
-        # 解析解密后 XML
         try:
-            data = xmltodict.parse(to_text(decrypted_xml)).get("xml", {})
+            data = xmltodict.parse(to_text(decrypted_xml)).get("xml", {}) or {}
         except Exception:
             logger.exception("safe-mode: parse decrypted xml fail. head=%r", _head_preview(to_text(decrypted_xml)))
             return PlainTextResponse("success")
@@ -436,23 +342,32 @@ async def wecom_callback(request: Request):
             logger.warning("plain-mode: body not xml. head=%r", _head_preview(text))
             return PlainTextResponse("success")
         try:
-            data = xmltodict.parse(text).get("xml", {})
+            data = xmltodict.parse(text).get("xml", {}) or {}
         except Exception:
             logger.exception("plain-mode: parse xml fail. head=%r", _head_preview(text))
             return PlainTextResponse("success")
 
-    # ---------- 以下继续你原来的业务逻辑 ----------
+    # -------- 业务处理 --------
     msg_type  = (data.get("MsgType") or "").lower()
-    from_user = data.get("FromUserName") or ""
+    from_user = (data.get("FromUserName") or "").strip()
     content   = (data.get("Content") or "").strip()
-    pic_url   = data.get("PicUrl") or ""
-    media_id  = data.get("MediaId") or ""
+    pic_url   = (data.get("PicUrl") or "").strip()
+    media_id  = (data.get("MediaId") or "").strip()
 
+    # 简单命令
     if content.lower() == "/ping":
         await send_text(from_user, "pong")
         return PlainTextResponse("success")
 
-    # .... 继续你的指令/LLM/PDF/图片逻辑
-    # reply_text = await handle_message(...)
-    # await send_text(from_user, reply_text)
+    # 文本消息 -> OpenAI
+    if msg_type == "text":
+        reply = await ask_llm(content or "（空消息）")
+        try:
+            await send_text(from_user, reply)
+        except Exception:
+            logger.exception("send_text failed")
+        return PlainTextResponse("success")
+
+    # 其它类型先回一条提示（可扩展：图片/语音/文件转写等）
+    await send_text(from_user, f"已收到消息类型：{msg_type}（暂未实现该类型处理）")
     return PlainTextResponse("success")
