@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse, Response
 from dotenv import load_dotenv
 from lxml import etree
-from openai import OpenAI
+from openai import OpenAI, BadRequestError  # <- 新增 BadRequestError
 
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.exceptions import InvalidSignatureException
@@ -60,7 +60,7 @@ app_state = {"active_model": MODEL_CANDIDATES[0]}
 oai = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    organization=OPENAI_ORG_ID or None,  # 显式绑定到已验证组织
+    organization=OPENAI_ORG_ID or None,  # 明确绑定组织
 )
 
 # ----- WeCom -----
@@ -82,7 +82,7 @@ else:
     log.info("WeCom running in PLAINTEXT mode.")
 
 # ---------------------------------------------------------------------
-# Access Token 缓存 + 【① 重试与兜底】
+# Access Token 缓存 + 指数退避 + 兜底
 # ---------------------------------------------------------------------
 _TOKEN_CACHE = {"value": None, "exp": 0}
 
@@ -93,7 +93,7 @@ async def get_wecom_token() -> str:
 
     url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={CORP_ID}&corpsecret={SECRET}"
     last_err = None
-    for attempt in range(3):  # 指数退避：0,1,2 -> sleep 1s/2s/4s
+    for attempt in range(3):
         try:
             timeout = httpx.Timeout(15.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -110,7 +110,6 @@ async def get_wecom_token() -> str:
             last_err = e
         await asyncio.sleep(2 ** attempt)
 
-    # 兜底：有旧 token 先用，避免丢回复
     if _TOKEN_CACHE["value"]:
         log.warning("gettoken failed (%s), fallback to cached token", last_err)
         return _TOKEN_CACHE["value"]
@@ -118,10 +117,9 @@ async def get_wecom_token() -> str:
     raise last_err or RuntimeError("gettoken failed")
 
 # ---------------------------------------------------------------------
-# 发送消息到 WeCom 【② send_text 失效重试 + 空内容兜底】
+# 发送文本到 WeCom（自动重试 + 空内容兜底）
 # ---------------------------------------------------------------------
 async def send_text(to_user: str, content: str) -> dict:
-    # ---- 兜底，避免空内容触发 44004 ----
     if not content or not str(content).strip():
         content = "（空内容占位：模型未返回文本，请重试或换个问法）"
 
@@ -143,7 +141,6 @@ async def send_text(to_user: str, content: str) -> dict:
 
     if isinstance(data, dict) and data.get("errcode") not in (0, None):
         log.warning("WeCom send first attempt failed: %s, retrying...", data)
-        # 强制刷新 token 再发一次
         _TOKEN_CACHE["exp"] = 0
         token = await get_wecom_token()
         url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
@@ -168,7 +165,7 @@ async def send_long_text(to_user: str, content: str, part_len: int = 1800, max_p
         await send_text(to_user, f"……内容较长，已发送前 {max_parts} 段，共 {len(parts)} 段。")
 
 # ---------------------------------------------------------------------
-# 群发：Webhook + appchat（可选启用）
+# 群发：Webhook + appchat（可选）
 # ---------------------------------------------------------------------
 ENABLE_GROUP_WEBHOOK = os.getenv("ENABLE_GROUP_WEBHOOK", "false").lower() == "true"
 WEBHOOK_KEYS = [k.strip() for k in os.getenv("WECOM_GROUP_WEBHOOK_KEYS", "").split(",") if k.strip()]
@@ -289,8 +286,10 @@ async def analyze_image_with_openai(path: str, content_type: Optional[str] = Non
                 {"type": "image_url", "image_url": {"url": data_url}}
             ]
         }]
+        # 这里直接用 create_chat_with_tokens，保持与文本同一路径
         resp = create_chat_with_tokens(app_state.get("active_model", MODEL_CANDIDATES[0]), messages, max_new_tokens=800)
-        return (resp.choices[0].message.content or "").strip()
+        txt = extract_text_from_oai_response(resp, app_state.get("active_model", MODEL_CANDIDATES[0]), messages)
+        return txt or "（模型未输出文本）"
     except Exception as e:
         return f"OpenAI 视觉解析失败：{e}"
 
@@ -364,17 +363,12 @@ if ENABLE_MEMORY and REDIS_URL:
         log.warning("Redis init failed: %s", e)
 
 # ---------------------------------------------------------------------
-# 幂等去重：优先 Redis (SETNX+EX)；无 Redis 用本地字典 + TTL
+# 幂等去重（Redis 优先）
 # ---------------------------------------------------------------------
 DEDUP_LOCAL = {}  # msg_key -> expire_ts
 
 async def is_duplicated_and_mark(msg_key: str, ttl: int = 300) -> bool:
-    """
-    返回 True 表示这条消息已处理过（重复），False 表示第一次看到并已标记。
-    """
     now = int(time.time())
-
-    # 优先使用 Redis
     try:
         if REDIS_MEMORY:
             cli = await REDIS_MEMORY.client()
@@ -388,7 +382,6 @@ async def is_duplicated_and_mark(msg_key: str, ttl: int = 300) -> bool:
     except Exception as e:
         log.warning("dedup via redis failed: %s; fallback to local", e)
 
-    # 本地兜底：清理过期
     if DEDUP_LOCAL and len(DEDUP_LOCAL) % 128 == 0:
         exp_keys = [k for k, ex in DEDUP_LOCAL.items() if ex <= now]
         for k in exp_keys:
@@ -401,11 +394,6 @@ async def is_duplicated_and_mark(msg_key: str, ttl: int = 300) -> bool:
     return False
 
 def make_msg_key(msg: dict) -> str:
-    """
-    生成去重用的 key：
-    - 优先使用 MsgId
-    - 无 MsgId（如 Event）时用字段指纹
-    """
     raw = (
         msg.get("MsgId")
         or "|".join([
@@ -421,21 +409,54 @@ def make_msg_key(msg: dict) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------
-# GPT-5/4o 参数兼容 + 模型降级
+# ✅ 这里是 3 处核心修改
+#    1) gpt-5/4o 参数自适配 & 强制文本输出（不支持时自动去掉重试）
+#    2) 从响应中提取文本（refusal/tool_calls 场景二次复询）
+#    3) 在 chat_with_fallback 中使用新的提取逻辑
 # ---------------------------------------------------------------------
 def create_chat_with_tokens(model: str, messages, max_new_tokens=300, temp_for_non_gpt5=0.3):
     """
-    gpt-5: 使用 max_completion_tokens，且不传 temperature
-    其它：使用 max_tokens，并可设置 temperature
+    gpt-5: 用 max_completion_tokens；不传 temperature
+    其它:  用 max_tokens + temperature
+    先带 response_format={'type':'text'} 强制文本，若不支持则自动去掉重试
     """
-    kwargs = dict(model=model, messages=messages)
-    if model.startswith("gpt-5"):
-        kwargs["max_completion_tokens"] = max_new_tokens
-        # 不传 temperature
-    else:
-        kwargs["max_tokens"] = max_new_tokens
-        kwargs["temperature"] = temp_for_non_gpt5
-    return oai.chat.completions.create(**kwargs)
+    def _kwargs(with_resp_fmt: bool):
+        kw = dict(model=model, messages=messages)
+        if model.startswith("gpt-5"):
+            kw["max_completion_tokens"] = max_new_tokens
+        else:
+            kw["max_tokens"] = max_new_tokens
+            kw["temperature"] = temp_for_non_gpt5
+        if with_resp_fmt:
+            kw["response_format"] = {"type": "text"}
+        return kw
+
+    try:
+        return oai.chat.completions.create(**_kwargs(with_resp_fmt=True))
+    except BadRequestError as e:
+        s = str(e).lower()
+        if "response_format" in s or "unsupported_parameter" in s:
+            return oai.chat.completions.create(**_kwargs(with_resp_fmt=False))
+        raise
+
+def extract_text_from_oai_response(resp, model: str, messages):
+    choice = resp.choices[0]
+    txt = (choice.message.content or "").strip()
+
+    if not txt:
+        refusal = getattr(choice.message, "refusal", None)
+        if refusal:
+            txt = str(refusal).strip()
+
+    if not txt and getattr(choice.message, "tool_calls", None):
+        more = messages + [{
+            "role": "system",
+            "content": "请只输出简短的中文纯文本回答，不要调用任何工具或函数。"
+        }]
+        resp2 = create_chat_with_tokens(model, more, max_new_tokens=300)
+        txt = (resp2.choices[0].message.content or "").strip()
+
+    return txt
 
 def _should_downgrade(err: Exception) -> bool:
     s = str(err).lower()
@@ -446,8 +467,11 @@ def chat_with_fallback(messages):
     for mdl in MODEL_CANDIDATES:
         try:
             resp = create_chat_with_tokens(mdl, messages, max_new_tokens=300)
+            txt = extract_text_from_oai_response(resp, mdl, messages)  # <- 使用提取器
             app_state["active_model"] = mdl
-            return (resp.choices[0].message.content or "").strip()
+            if not txt:
+                txt = "（模型未输出文本，请换个问法或稍后再试）"
+            return txt
         except Exception as e:
             last_err = e
             if _should_downgrade(e):
@@ -478,7 +502,7 @@ async def wecom_verify(request: Request,
     return echostr or ""
 
 # ---------------------------------------------------------------------
-# 消息回调（含文本/图片/文件） 【③ 失败返回 500 触发企微重试 + 幂等去重】
+# 消息回调
 # ---------------------------------------------------------------------
 @app.post("/wecom/callback", response_class=PlainTextResponse)
 async def wecom_callback(request: Request):
@@ -498,7 +522,7 @@ async def wecom_callback(request: Request):
         log.exception("parse/decrypt failed: %s", e)
         return JSONResponse({"ok": False, "error": f"parse/decrypt failed: {e}"}, status_code=200)
 
-    # -------- 幂等去重：重复投递直接丢弃，避免多次回复 --------
+    # 幂等去重
     msg_key = make_msg_key(msg)
     if await is_duplicated_and_mark(msg_key, ttl=300):
         log.info("dup message dropped: key=%s from=%s type=%s", msg_key, msg.get("FromUserName"), msg.get("MsgType"))
@@ -510,7 +534,7 @@ async def wecom_callback(request: Request):
     media_id = msg.get("MediaId")
     file_name = msg.get("FileName") or ""
 
-    # 简单测试命令：绕过 LLM，验证出站链路
+    # 自检
     if (content or "").strip().lower() in ("/ping", "ping", "测试"):
         try:
             ret = await send_text(from_user, "pong")
@@ -521,7 +545,7 @@ async def wecom_callback(request: Request):
             log.exception("WeCom send failed: %s", e)
             return PlainTextResponse("retry later", status_code=500)
 
-    # ====== 图片 ======
+    # 图片
     if msg_type == "image" and media_id:
         path, ctype = await download_media_to_tmp(media_id)
         if USE_LOCAL_OCR and LOCAL_OCR:
@@ -535,7 +559,7 @@ async def wecom_callback(request: Request):
             log.exception("WeCom send failed: %s", e)
             return PlainTextResponse("retry later", status_code=500)
 
-    # ====== 文件（PDF 优先）======
+    # 文件（PDF）
     if msg_type == "file" and media_id:
         path, ctype = await download_media_to_tmp(media_id)
         ext = os.path.splitext(file_name or path)[-1].lower()
@@ -553,10 +577,10 @@ async def wecom_callback(request: Request):
             log.exception("WeCom send failed: %s", e)
             return PlainTextResponse("retry later", status_code=500)
 
-    # ====== 群发命令解析（可选）======
+    # 群发/建群命令
     text_for_llm = content or (msg.get("Event") or "")
     broadcast_flag = False
-    new_chat_req = None  # (name, members)
+    new_chat_req = None
 
     low = (text_for_llm or "").strip()
     if low.startswith(("群发", "/broadcast", "broadcast")):
@@ -577,10 +601,17 @@ async def wecom_callback(request: Request):
         except Exception:
             new_chat_req = None
 
-    # ====== 构造上下文 ======
-    base_system = {"role": "system", "content": "You are a helpful assistant for WeCom users."}
+    # ✅ 强化系统提示：只输出纯文本（这是 3 处修改之一）
+    base_system = {
+        "role": "system",
+        "content": (
+            "You are a helpful assistant for WeCom users. "
+            "只输出中文的纯文本答案，不要调用任何工具或函数，不要输出 JSON/代码块/函数调用结果。"
+        ),
+    }
     messages = [base_system]
 
+    # 历史记忆
     if ENABLE_MEMORY and from_user:
         try:
             if REDIS_MEMORY:
@@ -594,15 +625,13 @@ async def wecom_callback(request: Request):
 
     messages.append({"role": "user", "content": text_for_llm})
 
-    # ====== 调 OpenAI（含降级） ======
+    # OpenAI 调用
     try:
         reply_text = chat_with_fallback(messages)
-        # 模型文本兜底，避免空字符串
         if not reply_text or not reply_text.strip():
             reply_text = "（模型未输出可读文本。建议换个问法，或发送 /ping 自检出站链路。）"
     except Exception as e:
         log.exception("OpenAI call failed: %s", e)
-        # 给用户也反馈错误
         try:
             ret = await send_text(from_user, f"OpenAI 调用失败：{e}")
             if isinstance(ret, dict) and ret.get("errcode", 0) != 0:
@@ -612,7 +641,7 @@ async def wecom_callback(request: Request):
             log.exception("WeCom send failed: %s", e2)
             return PlainTextResponse("retry later", status_code=500)
 
-    # ====== 写记忆 ======
+    # 写记忆
     if ENABLE_MEMORY and from_user:
         try:
             if REDIS_MEMORY:
@@ -622,7 +651,7 @@ async def wecom_callback(request: Request):
         except Exception as e:
             log.warning("append memory failed: %s", e)
 
-    # ====== 建群 / 群发 执行 ======
+    # 群发 / 建群
     try:
         if new_chat_req and ENABLE_APPCHAT:
             name, members = new_chat_req
@@ -650,14 +679,13 @@ async def wecom_callback(request: Request):
             if not sent:
                 await send_text(from_user, "未配置群聊通道：请设置 APPCHAT_DEFAULT_CHATID 或 WECOM_GROUP_WEBHOOK_KEYS。")
 
-        # ====== 最终回复用户 ======
+        # 最终回复
         ret = await send_text(from_user, reply_text)
         if isinstance(ret, dict) and ret.get("errcode", 0) != 0:
             raise RuntimeError(f"WeCom send err: {ret}")
         return PlainTextResponse("success")
     except Exception as e:
         log.exception("WeCom send failed: %s", e)
-        # 返回 500 让企微重试
         return PlainTextResponse("retry later", status_code=500)
 
 # ---------------------------------------------------------------------
