@@ -25,5 +25,9 @@ python-multipart>=0.0.9,<0.0.10
 orjson>=3.10,<4.0
 
 pymupdf==1.24.9
-pypdf==4.2.0
+pypdf>=4.2
+Pillow>=10.3
+# 本地 OCR（可选，若启用 LOCAL_OCR_ENABLE=true 才需要，且系统要装 tesseract）
+pytesseract>=0.3.10
+
 pydantic>=2.7,<3
