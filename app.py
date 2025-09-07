@@ -5,6 +5,7 @@ import base64
 import asyncio
 import logging
 import threading
+import hashlib
 from typing import Optional, Tuple, List
 from collections import deque
 
@@ -120,7 +121,7 @@ async def get_wecom_token() -> str:
 # 发送消息到 WeCom 【② send_text 失效重试 + 空内容兜底】
 # ---------------------------------------------------------------------
 async def send_text(to_user: str, content: str) -> dict:
-    # ---- 新增：兜底，避免空内容触发 44004 ----
+    # ---- 兜底，避免空内容触发 44004 ----
     if not content or not str(content).strip():
         content = "（空内容占位：模型未返回文本，请重试或换个问法）"
 
@@ -281,8 +282,13 @@ def encode_image_to_data_url(path: str, content_type: Optional[str] = None) -> s
 async def analyze_image_with_openai(path: str, content_type: Optional[str] = None, task: str = "请提取图片中的文字，并简要说明图像要点。"):
     data_url = encode_image_to_data_url(path, content_type)
     try:
-        # 用统一的 tokens/temperature 兼容函数
-        messages = [{"role": "user", "content": [{"type": "text", "text": task}, {"type": "image_url", "image_url": {"url": data_url}}]}]
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": task},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }]
         resp = create_chat_with_tokens(app_state.get("active_model", MODEL_CANDIDATES[0]), messages, max_new_tokens=800)
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
@@ -358,6 +364,63 @@ if ENABLE_MEMORY and REDIS_URL:
         log.warning("Redis init failed: %s", e)
 
 # ---------------------------------------------------------------------
+# 幂等去重：优先 Redis (SETNX+EX)；无 Redis 用本地字典 + TTL
+# ---------------------------------------------------------------------
+DEDUP_LOCAL = {}  # msg_key -> expire_ts
+
+async def is_duplicated_and_mark(msg_key: str, ttl: int = 300) -> bool:
+    """
+    返回 True 表示这条消息已处理过（重复），False 表示第一次看到并已标记。
+    """
+    now = int(time.time())
+
+    # 优先使用 Redis
+    try:
+        if REDIS_MEMORY:
+            cli = await REDIS_MEMORY.client()
+            key = f"wecom:dedup:{msg_key}"
+            added = await cli.setnx(key, "1")
+            if added:
+                await cli.expire(key, ttl)
+                return False
+            else:
+                return True
+    except Exception as e:
+        log.warning("dedup via redis failed: %s; fallback to local", e)
+
+    # 本地兜底：清理过期
+    if DEDUP_LOCAL and len(DEDUP_LOCAL) % 128 == 0:
+        exp_keys = [k for k, ex in DEDUP_LOCAL.items() if ex <= now]
+        for k in exp_keys:
+            DEDUP_LOCAL.pop(k, None)
+
+    if DEDUP_LOCAL.get(msg_key, 0) > now:
+        return True
+
+    DEDUP_LOCAL[msg_key] = now + ttl
+    return False
+
+def make_msg_key(msg: dict) -> str:
+    """
+    生成去重用的 key：
+    - 优先使用 MsgId
+    - 无 MsgId（如 Event）时用字段指纹
+    """
+    raw = (
+        msg.get("MsgId")
+        or "|".join([
+            msg.get("FromUserName") or "",
+            msg.get("CreateTime") or "",
+            msg.get("MsgType") or "",
+            msg.get("Event") or "",
+            msg.get("Content") or "",
+            msg.get("MediaId") or "",
+            msg.get("FileName") or "",
+        ])
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+# ---------------------------------------------------------------------
 # GPT-5/4o 参数兼容 + 模型降级
 # ---------------------------------------------------------------------
 def create_chat_with_tokens(model: str, messages, max_new_tokens=300, temp_for_non_gpt5=0.3):
@@ -415,7 +478,7 @@ async def wecom_verify(request: Request,
     return echostr or ""
 
 # ---------------------------------------------------------------------
-# 消息回调（含文本/图片/文件） 【③ 失败返回 500 触发企微重试】
+# 消息回调（含文本/图片/文件） 【③ 失败返回 500 触发企微重试 + 幂等去重】
 # ---------------------------------------------------------------------
 @app.post("/wecom/callback", response_class=PlainTextResponse)
 async def wecom_callback(request: Request):
@@ -434,6 +497,12 @@ async def wecom_callback(request: Request):
     except Exception as e:
         log.exception("parse/decrypt failed: %s", e)
         return JSONResponse({"ok": False, "error": f"parse/decrypt failed: {e}"}, status_code=200)
+
+    # -------- 幂等去重：重复投递直接丢弃，避免多次回复 --------
+    msg_key = make_msg_key(msg)
+    if await is_duplicated_and_mark(msg_key, ttl=300):
+        log.info("dup message dropped: key=%s from=%s type=%s", msg_key, msg.get("FromUserName"), msg.get("MsgType"))
+        return PlainTextResponse("success")
 
     from_user = msg.get("FromUserName") or ""
     msg_type = (msg.get("MsgType") or "").lower()
@@ -528,7 +597,7 @@ async def wecom_callback(request: Request):
     # ====== 调 OpenAI（含降级） ======
     try:
         reply_text = chat_with_fallback(messages)
-        # ---- 新增：模型文本兜底，避免空字符串 ----
+        # 模型文本兜底，避免空字符串
         if not reply_text or not reply_text.strip():
             reply_text = "（模型未输出可读文本。建议换个问法，或发送 /ping 自检出站链路。）"
     except Exception as e:
