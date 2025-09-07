@@ -1,9 +1,8 @@
+# app.py
 import os
 import io
 import json
 import base64
-import time
-import math
 import asyncio
 import logging
 from typing import Optional, Tuple, List
@@ -11,15 +10,14 @@ from typing import Optional, Tuple, List
 import httpx
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
 from openai import OpenAI
 
-# ---------- WeCom 依赖 ----------
+# ---------- WeCom / XML ----------
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.utils import to_text
 import xmltodict
 
-# ---------- 文档/图像处理 ----------
+# ---------- 文档/图像 ----------
 import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
@@ -36,7 +34,8 @@ log = logging.getLogger("wecom-app")
 # =========================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")  # 显式组织
+OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID", "")
+
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "gpt-5")
 MODEL_BACKUP = os.getenv("MODEL_BACKUP", "gpt-5-mini")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "gpt-4o-mini")
@@ -44,7 +43,7 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "gpt-4o-mini")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "gpt-4o-mini")
 
-LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() == "true"
+LOCAL_OCR_ENABLE = os.getenv("LOCAL_OCR_ENABLE", "false").lower() in ("true", "1", "on")
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "150000"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "4000"))
 CHUNK_SUMMARY = int(os.getenv("CHUNK_SUMMARY", "800"))
@@ -66,7 +65,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://host:6379/0")
 SESSION_TTL = int(os.getenv("SESSION_TTL", "86400"))
 
 # 其它
-SEND_MAX_LEN = int(os.getenv("SEND_MAX_LEN", "1900"))  # 单条消息最大字数，避免企业微信超限
+SEND_MAX_LEN = int(os.getenv("SEND_MAX_LEN", "1900"))  # 企业微信文字长度安全阈值
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
 # =========================================================
@@ -75,7 +74,7 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 oai = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    organization=(OPENAI_ORG_ID or None),
+    organization=(OPENAI_ORG_ID or None),  # 显式组织 ID
 )
 
 # =========================================================
@@ -89,7 +88,7 @@ app = FastAPI()
 class MemoryStore:
     def __init__(self):
         self.r = None
-        self.mem = {}
+        self.mem: dict[str, List[dict]] = {}
         if MEMORY_BACKEND == "redis":
             try:
                 self.r = redis.from_url(REDIS_URL)
@@ -123,7 +122,6 @@ class MemoryStore:
         except Exception as e:
             log.warning(f"append memory failed: {e}")
 
-
 memory = MemoryStore()
 
 # =========================================================
@@ -140,9 +138,9 @@ async def send_text(to_user: str, content: str):
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
 
-    # 分片发送，避免超限
-    chunks = []
-    text = content.strip() or "（空）"
+    # 分片发送
+    chunks: List[str] = []
+    text = (content or "").strip() or "（空）"
     while len(text) > SEND_MAX_LEN:
         chunks.append(text[:SEND_MAX_LEN])
         text = text[SEND_MAX_LEN:]
@@ -161,16 +159,12 @@ async def send_text(to_user: str, content: str):
             data = r.json()
             log.warning(f"WeCom send result -> to={to_user} payload_len={len(chunk)} resp={data}")
 
-            # 44004 空文本保护（极少数情况下模型回空）
+            # 44004 空文本保护
             if data.get("errcode") == 44004:
                 payload["text"]["content"] = "（模型未输出文本，建议换个问法或稍后重试）"
-                r = await client.post(url, json=payload)
-                log.warning("WeCom empty content retry once.")
+                await client.post(url, json=payload)
 
 async def download_wecom_media(media_id: str) -> Tuple[bytes, str]:
-    """
-    返回 (bytes, content_type)
-    """
     token = await get_wecom_token()
     url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -185,134 +179,130 @@ def _local_ocr(image_bytes: bytes) -> str:
     try:
         img = Image.open(io.BytesIO(image_bytes))
         text = pytesseract.image_to_string(img, lang="chi_sim+eng")
-        return text.strip()
+        return (text or "").strip()
     except Exception as e:
         log.warning(f"local ocr fail: {e}")
         return ""
 
 async def _vision_ocr(image_bytes: bytes) -> str:
     b64 = base64.b64encode(image_bytes).decode()
-    # 使用 chat.completions Vision 输入
     try:
         resp = oai.chat.completions.create(
             model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "从图片中**提取所有可见文字**，保持自然段顺序，不要额外解释。"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "从图片中提取所有可见文字，按自然段返回，不要解释。"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}" }},
+                ],
+            }],
             max_completion_tokens=1024,
         )
-        txt = (resp.choices[0].message.content or "").strip()
-        return txt
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         log.warning(f"vision ocr fail: {e}")
         return ""
 
 async def ocr_image(image_bytes: bytes) -> str:
     if LOCAL_OCR_ENABLE:
-        text = _local_ocr(image_bytes)
-        if text:
-            return text
-        # 本地识别失败则回退云端
+        txt = _local_ocr(image_bytes)
+        if txt:
+            return txt
     return await _vision_ocr(image_bytes)
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    先用 PyMuPDF 提取文本；若页面文本稀少，则转图后本地 OCR（需要 tesseract），最后拼接。
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
-    for i, page in enumerate(doc):
+    parts: List[str] = []
+    for page in doc:
         txt = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)
         txt = (txt or "").strip()
         if len(txt) < 20 and LOCAL_OCR_ENABLE:
-            # 回退为图片 OCR
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 提高分辨率
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             img_bytes = pix.tobytes("png")
-            txt = _local_ocr(img_bytes)
+            txt = _local_ocr(img_bytes) or ""
         parts.append(txt)
     text = "\n\n".join([p for p in parts if p])
     return text[:MAX_INPUT_CHARS]
 
 # =========================================================
-# 分块摘要
+# 文本分块摘要
 # =========================================================
 async def summarize_long_text(raw_text: str, system_prompt: str = "你是专业的文档助理。") -> str:
     text = (raw_text or "").strip()
     if not text:
         return "（未从文件中提取到可读文字）"
 
+    # 单段
     if len(text) <= CHUNK_SIZE:
-        msgs = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"请用要点+结论总结这段文字（150-300字）：\n{text}"}]
-        for model in (SUMMARIZER_MODEL, MODEL_FALLBACK):
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"请用要点+结论总结（150-300字）：\n{text}"},
+        ]
+        for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
             try:
-                resp = oai.chat.completions.create(
-                    model=model,
-                    messages=msgs,
-                    max_completion_tokens=CHUNK_SUMMARY,
-                )
+                kwargs = dict(model=m, messages=msgs)
+                if m.startswith("gpt-5"):
+                    kwargs["max_completion_tokens"] = CHUNK_SUMMARY
+                else:
+                    kwargs["max_tokens"] = CHUNK_SUMMARY
+                    kwargs["temperature"] = 1
+                resp = oai.chat.completions.create(**kwargs)
                 out = (resp.choices[0].message.content or "").strip()
                 if out:
                     return out
             except Exception as e:
-                log.warning(f"summarize single fail with {model}: {e}")
+                log.warning(f"summarize fail {m}: {e}")
         return "（摘要失败）"
 
-    # 分块
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i + CHUNK_SIZE])
-        i += CHUNK_SIZE
-
-    bullets = []
+    # 多段
+    chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+    bullets: List[str] = []
     for idx, ck in enumerate(chunks, 1):
-        prompt = f"第{idx}/{len(chunks)}段，请提取3-5条要点，保留关键数字/专有名词：\n{ck}"
-        msgs = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}]
-        summary_piece = ""
-        for model in (SUMMARIZER_MODEL, MODEL_FALLBACK):
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"第{idx}/{len(chunks)}段，提取3-5条要点，保留关键数字/名词：\n{ck}"},
+        ]
+        piece = ""
+        for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
             try:
-                resp = oai.chat.completions.create(
-                    model=model,
-                    messages=msgs,
-                    max_completion_tokens=CHUNK_SUMMARY,
-                )
-                summary_piece = (resp.choices[0].message.content or "").strip()
-                if summary_piece:
+                kwargs = dict(model=m, messages=msgs)
+                if m.startswith("gpt-5"):
+                    kwargs["max_completion_tokens"] = CHUNK_SUMMARY
+                else:
+                    kwargs["max_tokens"] = CHUNK_SUMMARY
+                    kwargs["temperature"] = 1
+                resp = oai.chat.completions.create(**kwargs)
+                piece = (resp.choices[0].message.content or "").strip()
+                if piece:
                     break
             except Exception as e:
-                log.warning(f"chunk summarize fail with {model}: {e}")
-        if summary_piece:
-            bullets.append(f"- {summary_piece}")
+                log.warning(f"chunk summarize fail {m}: {e}")
+        if piece:
+            bullets.append(f"- {piece}")
 
-    # 汇总
     join_text = "\n".join(bullets)[:MAX_INPUT_CHARS]
-    final_prompt = f"以下是分段要点，请合并去重并给出‘结论/建议’：\n{join_text}"
-    msgs = [{"role": "system", "content": system_prompt},
-            {"role": "user", "content": final_prompt}]
-    for model in (SUMMARIZER_MODEL, MODEL_FALLBACK):
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"以下为各段要点，请合并去重并给出‘结论/建议’：\n{join_text}"},
+    ]
+    for m in (SUMMARIZER_MODEL, MODEL_FALLBACK):
         try:
-            resp = oai.chat.completions.create(
-                model=model,
-                messages=msgs,
-                max_completion_tokens=CHUNK_SUMMARY,
-            )
+            kwargs = dict(model=m, messages=msgs)
+            if m.startswith("gpt-5"):
+                kwargs["max_completion_tokens"] = CHUNK_SUMMARY
+            else:
+                kwargs["max_tokens"] = CHUNK_SUMMARY
+                kwargs["temperature"] = 1
+            resp = oai.chat.completions.create(**kwargs)
             out = (resp.choices[0].message.content or "").strip()
             if out:
                 return out
         except Exception as e:
-            log.warning(f"final summarize fail with {model}: {e}")
+            log.warning(f"final summarize fail {m}: {e}")
     return "（汇总失败）"
 
 # =========================================================
-# 搜索（SerpAPI）
+# SerpAPI 搜索
 # =========================================================
 async def serp_search(q: str) -> str:
     if not (WEB_SEARCH_ENABLE and SERPAPI_API_KEY):
@@ -326,19 +316,15 @@ async def serp_search(q: str) -> str:
         title = item.get("title") or item.get("displayed_link") or "结果"
         link = item.get("link") or ""
         links.append(f"[{title}]\n{link}")
-    if not links:
-        return "（没有搜到可用结果）"
-    return "🔎 已联网搜索（serpapi）：\n" + "\n\n".join(links)
+    return "🔎 已联网搜索（serpapi）：\n" + ("\n\n".join(links) if links else "（没有搜到可用结果）")
 
 # =========================================================
-# OpenAI 对话（含兜底）
+# Chat（含兜底链）
 # =========================================================
 async def chat_with_models(messages: List[dict], max_out: int = 512) -> str:
-    chain = (MODEL_PRIMARY, MODEL_BACKUP, MODEL_FALLBACK)
-    for m in chain:
+    for m in (MODEL_PRIMARY, MODEL_BACKUP, MODEL_FALLBACK):
         try:
             kwargs = dict(model=m, messages=messages)
-            # gpt-5 系列不支持 temperature/max_tokens，需要用 max_completion_tokens
             if m.startswith("gpt-5"):
                 kwargs["max_completion_tokens"] = max_out
             else:
@@ -348,10 +334,26 @@ async def chat_with_models(messages: List[dict], max_out: int = 512) -> str:
             out = (resp.choices[0].message.content or "").strip()
             if out:
                 return out
-            log.warning(f"primary model {m} failed: empty content")
+            log.warning(f"model {m} returned empty content")
         except Exception as e:
             log.warning(f"model {m} call fail: {e}")
     return "（模型临时没有返回内容，建议换个说法或稍后重试）"
+
+# =========================================================
+# 工具：清洗/重建 XML 以处理 ExpatError
+# =========================================================
+def clean_xml_payload(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.lstrip("\ufeff \t\r\n")
+    i = s.find("<")
+    if i > 0:
+        s = s[i:]
+    # 只保留到最后一个 '>'（去尾部脏字节）
+    j = s.rfind(">")
+    if j >= 0:
+        s = s[:j+1]
+    return s
 
 # =========================================================
 # 路由
@@ -393,7 +395,8 @@ async def wecom_callback(
     timestamp: str = Query(""),
     nonce: str = Query("")
 ):
-    xml_text = (await request.body()).decode("utf-8", errors="ignore") if SAFE_MODE else (await request.body())
+    body_bytes = await request.body()
+    xml_text = body_bytes.decode("utf-8", errors="ignore") if SAFE_MODE else body_bytes  # safe-mode 走 str
 
     # 先尝试解密
     try:
@@ -401,14 +404,15 @@ async def wecom_callback(
         decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, xml_text)
         msg = xmltodict.parse(to_text(decrypted_xml))["xml"]
     except Exception as e:
-        # 解析异常，按明文 xml 尝试一次（企业微信偶发回明文）
+        # 解密失败：尝试清洗后的明文 XML（企业微信偶发明文/前后带脏字节）
         log.error(f"ERROR:wecom-app:decrypt fail (safe-mode): {e}")
         try:
-            log.warning(f"safe-mode: using payload (xml); head='{xml_text[:120]}'")
-            msg = xmltodict.parse(to_text(xml_text))["xml"]
+            cleaned = clean_xml_payload(xml_text)
+            log.warning(f"safe-mode: using cleaned payload; head='{cleaned[:120]}'")
+            msg = xmltodict.parse(to_text(cleaned))["xml"]
         except Exception as e2:
             log.error(f"decrypt retry fail: {e2}")
-            return PlainTextResponse("success")  # 返回 success 不重试
+            return PlainTextResponse("success")  # 一律返回 success，避免企业微信重试风暴
 
     to_user = msg.get("ToUserName", "")
     from_user = msg.get("FromUserName", "")
@@ -418,12 +422,11 @@ async def wecom_callback(
     if msg_type == "text":
         content = (msg.get("Content") or "").strip()
 
-        # 指令：/ping
         if content == "/ping":
             info = (
                 f"当前活跃模型：{MODEL_PRIMARY}\n"
                 f"候选列表：{MODEL_PRIMARY}, {MODEL_BACKUP}, {MODEL_FALLBACK}\n"
-                f"组织ID： {OPENAI_ORG_ID or '-'}\n"
+                f"组织ID：{OPENAI_ORG_ID or '-'}\n"
                 f"记忆：{MEMORY_BACKEND}\n"
                 f"联网搜索：{'on/serpapi' if (WEB_SEARCH_ENABLE and SERPAPI_API_KEY) else 'off'}\n"
                 f"PDF/图片解析：已启用（LOCAL_OCR={'on' if LOCAL_OCR_ENABLE else 'off'}）"
@@ -431,14 +434,13 @@ async def wecom_callback(
             await send_text(from_user, info)
             return PlainTextResponse("success")
 
-        # 指令：/web xxx
         if content.startswith("/web "):
             q = content[5:].strip()
             result = await serp_search(q)
             await send_text(from_user, result)
             return PlainTextResponse("success")
 
-        # 普通对话：带记忆
+        # 普通对话（带记忆）
         history = memory.load(from_user)
         history.append({"role": "user", "content": content})
         reply = await chat_with_models(history, max_out=512)
@@ -464,20 +466,18 @@ async def wecom_callback(
             await send_text(from_user, "（图片解析失败）")
         return PlainTextResponse("success")
 
-    # ---------- 文件（含 PDF、图片当附件等） ----------
+    # ---------- 文件（PDF / 图片等） ----------
     if msg_type == "file":
-        fname = (msg.get("FileName") or "").strip()
+        fname = (msg.get("FileName") or "").strip().lower()
         media_id = msg.get("MediaId")
         await send_text(from_user, f"已收到文件：{fname}，正在处理…")
         try:
             file_bytes, ct = await download_wecom_media(media_id)
-            name_low = fname.lower()
             summary = ""
-
-            if name_low.endswith(".pdf") or "pdf" in ct:
+            if fname.endswith(".pdf") or "pdf" in ct:
                 text = extract_text_from_pdf(file_bytes)
                 summary = await summarize_long_text(text, "你是专业文档助理。")
-            elif any(name_low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")) or ("image/" in ct):
+            elif any(fname.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")) or ("image/" in ct):
                 ocr_txt = await ocr_image(file_bytes)
                 summary = await summarize_long_text(ocr_txt, "你是图像文字识别与摘要助手。")
             else:
@@ -489,6 +489,6 @@ async def wecom_callback(
             await send_text(from_user, "（文件解析失败）")
         return PlainTextResponse("success")
 
-    # 其它类型：直接忽略
+    # 其它类型
     await send_text(from_user, f"（暂未支持的消息类型：{msg_type}）")
     return PlainTextResponse("success")
