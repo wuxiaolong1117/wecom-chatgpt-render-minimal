@@ -353,72 +353,53 @@ async def wecom_callback(request: Request):
     if request.method == "GET" and echostr:
         return PlainTextResponse(echostr)
 
-    # 统一拿查询参数
-    msg_signature = request.query_params.get("msg_signature")
-    timestamp = request.query_params.get("timestamp")
-    nonce = request.query_params.get("nonce")
+   # ...... 前面的 query 参数获取保留
+msg_signature = request.query_params.get("msg_signature")
+timestamp     = request.query_params.get("timestamp")
+nonce         = request.query_params.get("nonce")
 
-    # 读取原始 XML（无论明文/密文，回包体都是 XML）
-    xml_text = (await request.body()).decode("utf-8", errors="ignore")
-
-    # ---- 1) 明文模式：没有 msg_signature 就按明文解析 ----
-    if not msg_signature:
-        try:
-            data = xmltodict.parse(xml_text).get("xml", {}) or {}
-        except Exception:
-            logger.exception("xmltodict parse error (plaintext)")
-            return PlainTextResponse("invalid xml", status_code=400)
-
-        from_user = (data.get("FromUserName") or "").strip()
-        msg_type  = (data.get("MsgType") or "").strip()
-        content   = (data.get("Content") or "").strip()
-
-        # 根据你的逻辑处理文本/文件/图片等
-        reply_text = await handle_user_text(from_user, content)
-
-        try:
-            await send_text(from_user, reply_text)
-        except Exception:
-            logger.exception("send_text failed (plaintext)")
-            return PlainTextResponse("success")  # 仍返回 success，避免企业微信重试
-
-        return PlainTextResponse("success")
-
-    # ---- 2) 安全模式（密文）：需要 wechatpy 解密 ----
+# --- 仅在带 msg_signature 的情况下进入安全模式 ---
+if msg_signature and WECOM_AES_KEY and WECOM_AES_KEY.strip():
     if WeChatCrypto is None:
-        logger.error("收到加密消息但未安装 wechatpy，无法解密")
+        logger.error("decrypt fail (safe-mode): wechatpy not installed, skip")
         return PlainTextResponse("success")
 
-    if not all([WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID]):
-        logger.error("加密模式需要 WECOM_TOKEN/WECOM_AES_KEY/WEWORK_CORP_ID")
+    # 1) 只读一次原始 body（Starlette 会缓存，重复读取也返回相同内容，但我们主动只读一次）
+    raw_body = await request.body()
+
+    # 2) 如果网关加了 gzip（少见，但有些反代会这样）
+    if request.headers.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            import gzip
+            raw_body = gzip.decompress(raw_body)
+        except Exception as e:
+            logger.warning("safe-mode: gzip decompress fail: %s", e)
+
+    # 3) 解码为文本，并裁剪 BOM/空白
+    xml_text = raw_body.decode("utf-8", "ignore").lstrip("\ufeff").strip()
+
+    # 4) 基本校验：必须是 XML
+    if not xml_text or not xml_text.startswith("<"):
+        logger.error("safe-mode: body is not xml, head=%r", xml_text[:200])
         return PlainTextResponse("success")
 
     try:
         crypto = WeChatCrypto(WECOM_TOKEN, WECOM_AES_KEY, WEWORK_CORP_ID)
-        # 企业微信(政企/WW)的 wechatpy 接口为：decrypt_message(msg_signature, timestamp, nonce, post_data)
         decrypted_xml = crypto.decrypt_message(msg_signature, timestamp, nonce, xml_text)
-    except Exception:
-        logger.exception("decrypt fail (safe-mode)")
+    except Exception as e:
+        logger.exception("ERROR:wecom-app:decrypt fail (safe-mode)")
         return PlainTextResponse("success")
 
+    # 5) 解析解密后的 XML
     try:
-        data = xmltodict.parse(decrypted_xml).get("xml", {}) or {}
-    except Exception:
-        logger.exception("xmltodict parse error (safe-mode)")
+        data = xmltodict.parse(to_text(decrypted_xml)).get("xml", {})
+    except Exception as e:
+        logger.exception("safe-mode: parse decrypted xml fail")
         return PlainTextResponse("success")
 
-    from_user = (data.get("FromUserName") or "").strip()
-    msg_type  = (data.get("MsgType") or "").strip()
-
-    # 这里只演示文本，你也可以在此处接入图片/文件等逻辑
-    content   = (data.get("Content") or "").strip()
-    reply_text = await handle_user_text(from_user, content)
-
-    try:
-        await send_text(from_user, reply_text)
-    except Exception:
-        logger.exception("send_text failed (safe-mode)")
-        # 仍返回 success，避免平台重试
-        return PlainTextResponse("success")
-
-    return PlainTextResponse("success")
+    # 后面把 data 当成明文模式一样处理即可
+    msg_type = (data.get("MsgType") or "").lower()
+    from_user = data.get("FromUserName") or ""
+    content = (data.get("Content") or "").strip()
+    pic_url = data.get("PicUrl") or ""
+    # ... 你的业务逻辑 ...
